@@ -2583,6 +2583,13 @@ def read_secret(name, default=""):
     return default if value is None else str(value).strip()
 
 
+def read_secret_bool(name, default=False):
+    value = read_secret(name)
+    if not value:
+        return default
+    return value.casefold() in {"1", "true", "yes", "y", "on"}
+
+
 def response_error_message(response):
     try:
         payload = response.json()
@@ -2683,18 +2690,20 @@ def find_eorigin_item_id(items, wanted, label):
 
 
 def resolve_eorigin_customer_id(token):
-    saved_id = read_secret("EORIGIN_CUSTOMER_ID")
-    if saved_id:
-        return saved_id
     customer_name = read_secret("EORIGIN_CUSTOMER_NAME", EORIGIN_DEFAULT_CUSTOMER_NAME)
+    saved_id = read_secret("EORIGIN_CUSTOMER_ID", customer_name)
+    if not read_secret_bool("EORIGIN_LOOKUP_IDS", False):
+        return saved_id
+
     return find_eorigin_item_id(list_payload_items(eorigin_get_json("/customers", token)), customer_name, "customer")
 
 
 def resolve_eorigin_template_id(token):
-    saved_id = read_secret("EORIGIN_TEMPLATE_ID")
-    if saved_id:
-        return saved_id
     template_name = read_secret("EORIGIN_TEMPLATE_NAME", EORIGIN_DEFAULT_TEMPLATE_NAME)
+    saved_id = read_secret("EORIGIN_TEMPLATE_ID", template_name)
+    if not read_secret_bool("EORIGIN_LOOKUP_IDS", False):
+        return saved_id
+
     return find_eorigin_item_id(list_payload_items(eorigin_get_json("/templates", token)), template_name, "template")
 
 

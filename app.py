@@ -2583,13 +2583,6 @@ def read_secret(name, default=""):
     return default if value is None else str(value).strip()
 
 
-def read_secret_bool(name, default=False):
-    value = read_secret(name)
-    if not value:
-        return default
-    return value.casefold() in {"1", "true", "yes", "y", "on"}
-
-
 def response_error_message(response):
     try:
         payload = response.json()
@@ -2637,74 +2630,14 @@ def eorigin_authorization_token(token, email, password):
     return authenticate_eorigin(email, password)
 
 
-def eorigin_get_json(path, token):
-    response = requests.get(
-        f"{EORIGIN_API_BASE_URL}{path}",
-        headers={"Authorization": f"Bearer {token}"},
-        timeout=30,
-    )
-    if not response.ok:
-        raise RuntimeError(f"E-Origin {path} failed: {response_error_message(response)}")
-    try:
-        return response.json()
-    except ValueError as exc:
-        raise RuntimeError(f"E-Origin {path} response is not valid JSON.") from exc
-
-
-def list_payload_items(payload):
-    if isinstance(payload, list):
-        return payload
-    if isinstance(payload, dict):
-        for key in ("data", "items", "results", "customers", "templates"):
-            value = payload.get(key)
-            if isinstance(value, list):
-                return value
-        if payload.get("_id") or payload.get("name"):
-            return [payload]
-    return []
-
-
-def normalize_lookup_text(value):
-    return re.sub(r"\s+", " ", str(value or "").strip()).casefold()
-
-
-def find_eorigin_item_id(items, wanted, label):
-    wanted_norm = normalize_lookup_text(wanted)
-    if not wanted_norm:
-        raise RuntimeError(f"E-Origin {label} name is empty.")
-
-    for item in items:
-        if not isinstance(item, dict):
-            continue
-        item_id = str(item.get("_id") or item.get("id") or "").strip()
-        item_name = str(item.get("name") or "").strip()
-        if normalize_lookup_text(item_name) == wanted_norm or normalize_lookup_text(item_id) == wanted_norm:
-            return item_id or item_name
-
-    available = ", ".join(
-        str(item.get("name") or item.get("_id") or item.get("id"))
-        for item in items
-        if isinstance(item, dict) and (item.get("name") or item.get("_id") or item.get("id"))
-    )
-    raise RuntimeError(f"E-Origin {label} '{wanted}' was not found. Available: {available[:500]}")
-
-
-def resolve_eorigin_customer_id(token):
+def resolve_eorigin_customer_id(_token):
     customer_name = read_secret("EORIGIN_CUSTOMER_NAME", EORIGIN_DEFAULT_CUSTOMER_NAME)
-    saved_id = read_secret("EORIGIN_CUSTOMER_ID", customer_name)
-    if not read_secret_bool("EORIGIN_LOOKUP_IDS", False):
-        return saved_id
-
-    return find_eorigin_item_id(list_payload_items(eorigin_get_json("/customers", token)), customer_name, "customer")
+    return read_secret("EORIGIN_CUSTOMER_ID", customer_name)
 
 
-def resolve_eorigin_template_id(token):
+def resolve_eorigin_template_id(_token):
     template_name = read_secret("EORIGIN_TEMPLATE_NAME", EORIGIN_DEFAULT_TEMPLATE_NAME)
-    saved_id = read_secret("EORIGIN_TEMPLATE_ID", template_name)
-    if not read_secret_bool("EORIGIN_LOOKUP_IDS", False):
-        return saved_id
-
-    return find_eorigin_item_id(list_payload_items(eorigin_get_json("/templates", token)), template_name, "template")
+    return read_secret("EORIGIN_TEMPLATE_ID", template_name)
 
 
 def build_eorigin_upload_file(modified_files):

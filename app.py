@@ -39,6 +39,9 @@ VAT_OTHER_ADDITION = Decimal("40")
 VAT_CSV_NAME = "VAT_charge.csv"
 EORIGIN_API_BASE_URL = "https://athinalogistics.eorigin.eu/api/v1/external"
 EORIGIN_UPLOAD_TIMEOUT = 90
+EORIGIN_DEFAULT_CUSTOMER_NAME = "MT INDIRECT"
+EORIGIN_DEFAULT_TEMPLATE_NAME = "H1 B2B CT MET LGG- MET6 INDIR N821"
+EORIGIN_STATE_KEY = "eorigin_success_output"
 
 COUNTRY_CODE_RE = re.compile(r"^[A-Z]{2}$")
 OOXML_NS = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
@@ -89,6 +92,42 @@ def configure_page():
 def natural_key(path_or_name):
     stem = Path(str(path_or_name)).stem
     return [int(t) if t.isdigit() else t.lower() for t in re.split(r"(\d+)", stem)]
+
+
+def invoice_prefix(file_name):
+    stem = Path(str(file_name)).stem.strip()
+    return stem.split("-", 1)[0].strip() or stem
+
+
+def batch_name_from_modified_files(modified_files):
+    if not modified_files:
+        return time.strftime("%Y%m%d-%H%M%S")
+    first_name = sorted((name for name, _ in modified_files), key=natural_key)[0]
+    return invoice_prefix(first_name)
+
+
+def uploaded_file_signature(uploaded_file):
+    if uploaded_file is None:
+        return None
+    size = getattr(uploaded_file, "size", None)
+    if size is None:
+        try:
+            size = len(uploaded_file.getvalue())
+        except Exception:
+            size = ""
+    return (getattr(uploaded_file, "name", ""), size)
+
+
+def current_processing_signature(invoice_files, t1_pdf, ship_name, thc_text, mrn_override, date_override, allow_errors):
+    return (
+        tuple(uploaded_file_signature(file) for file in invoice_files or []),
+        uploaded_file_signature(t1_pdf),
+        str(ship_name or "").strip(),
+        str(thc_text or "").strip(),
+        str(mrn_override or "").strip(),
+        str(date_override or "").strip(),
+        bool(allow_errors),
+    )
 
 
 def sanitize_filename_part(value):
@@ -2584,6 +2623,81 @@ def authenticate_eorigin(email, password):
     return token
 
 
+def eorigin_authorization_token(token, email, password):
+    token = normalize_bearer_token(token)
+    if token:
+        return token
+    return authenticate_eorigin(email, password)
+
+
+def eorigin_get_json(path, token):
+    response = requests.get(
+        f"{EORIGIN_API_BASE_URL}{path}",
+        headers={"Authorization": f"Bearer {token}"},
+        timeout=30,
+    )
+    if not response.ok:
+        raise RuntimeError(f"E-Origin {path} failed: {response_error_message(response)}")
+    try:
+        return response.json()
+    except ValueError as exc:
+        raise RuntimeError(f"E-Origin {path} response is not valid JSON.") from exc
+
+
+def list_payload_items(payload):
+    if isinstance(payload, list):
+        return payload
+    if isinstance(payload, dict):
+        for key in ("data", "items", "results", "customers", "templates"):
+            value = payload.get(key)
+            if isinstance(value, list):
+                return value
+        if payload.get("_id") or payload.get("name"):
+            return [payload]
+    return []
+
+
+def normalize_lookup_text(value):
+    return re.sub(r"\s+", " ", str(value or "").strip()).casefold()
+
+
+def find_eorigin_item_id(items, wanted, label):
+    wanted_norm = normalize_lookup_text(wanted)
+    if not wanted_norm:
+        raise RuntimeError(f"E-Origin {label} name is empty.")
+
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        item_id = str(item.get("_id") or item.get("id") or "").strip()
+        item_name = str(item.get("name") or "").strip()
+        if normalize_lookup_text(item_name) == wanted_norm or normalize_lookup_text(item_id) == wanted_norm:
+            return item_id or item_name
+
+    available = ", ".join(
+        str(item.get("name") or item.get("_id") or item.get("id"))
+        for item in items
+        if isinstance(item, dict) and (item.get("name") or item.get("_id") or item.get("id"))
+    )
+    raise RuntimeError(f"E-Origin {label} '{wanted}' was not found. Available: {available[:500]}")
+
+
+def resolve_eorigin_customer_id(token):
+    saved_id = read_secret("EORIGIN_CUSTOMER_ID")
+    if saved_id:
+        return saved_id
+    customer_name = read_secret("EORIGIN_CUSTOMER_NAME", EORIGIN_DEFAULT_CUSTOMER_NAME)
+    return find_eorigin_item_id(list_payload_items(eorigin_get_json("/customers", token)), customer_name, "customer")
+
+
+def resolve_eorigin_template_id(token):
+    saved_id = read_secret("EORIGIN_TEMPLATE_ID")
+    if saved_id:
+        return saved_id
+    template_name = read_secret("EORIGIN_TEMPLATE_NAME", EORIGIN_DEFAULT_TEMPLATE_NAME)
+    return find_eorigin_item_id(list_payload_items(eorigin_get_json("/templates", token)), template_name, "template")
+
+
 def build_eorigin_upload_file(modified_files):
     if len(modified_files) == 1:
         file_name, file_bytes = modified_files[0]
@@ -2601,13 +2715,13 @@ def build_eorigin_upload_file(modified_files):
     return "EORIGIN_modified_invoices_upload.zip", output.getvalue(), "application/zip"
 
 
-def upload_modified_invoices_to_eorigin(modified_files, batch_name, customer_id, template_id, token, email, password):
+def upload_modified_invoices_to_eorigin(modified_files, batch_name, token, email, password):
     if not modified_files:
         raise ValueError("No modified invoice available to upload.")
 
-    token = normalize_bearer_token(token)
-    if not token:
-        token = authenticate_eorigin(email, password)
+    token = eorigin_authorization_token(token, email, password)
+    customer_id = resolve_eorigin_customer_id(token)
+    template_id = resolve_eorigin_template_id(token)
 
     upload_name, upload_bytes, upload_mime = build_eorigin_upload_file(modified_files)
     response = requests.post(
@@ -2642,61 +2756,45 @@ def render_eorigin_upload_box(processing, default_batch_name):
     st.subheader("E-Origin Upload")
     st.caption("Uploads the modified invoice file(s) with the E-Origin external API.")
 
-    with st.expander("Upload modified invoices to E-Origin"):
-        st.caption(
-            "For Streamlit Cloud, prefer setting EORIGIN_TOKEN or EORIGIN_EMAIL / "
-            "EORIGIN_PASSWORD plus EORIGIN_CUSTOMER_ID and EORIGIN_TEMPLATE_ID in app secrets."
-        )
+    if st.session_state.get("eorigin_batch_source") != default_batch_name:
+        st.session_state["eorigin_batch_name"] = default_batch_name
+        st.session_state["eorigin_batch_source"] = default_batch_name
 
-        batch_name = st.text_input("Batch name", value=default_batch_name, key="eorigin_batch_name")
+    saved_token = read_secret("EORIGIN_TOKEN")
+    saved_email = read_secret("EORIGIN_EMAIL")
+    saved_password = read_secret("EORIGIN_PASSWORD")
+    has_saved_login = bool(saved_token or (saved_email and saved_password))
+    customer_name = read_secret("EORIGIN_CUSTOMER_NAME", EORIGIN_DEFAULT_CUSTOMER_NAME)
+    template_name = read_secret("EORIGIN_TEMPLATE_NAME", EORIGIN_DEFAULT_TEMPLATE_NAME)
 
-        c1, c2 = st.columns(2)
-        customer_id_input = c1.text_input(
-            "Customer ID",
-            placeholder="Configured in secrets" if read_secret("EORIGIN_CUSTOMER_ID") else "Required",
-            key="eorigin_customer_id",
-        )
-        template_id_input = c2.text_input(
-            "Template ID",
-            placeholder="Configured in secrets" if read_secret("EORIGIN_TEMPLATE_ID") else "Required",
-            key="eorigin_template_id",
-        )
+    with st.expander("Upload modified invoices to E-Origin", expanded=True):
+        st.caption(f"Customer: {customer_name} | Template: {template_name}")
 
-        token_input = st.text_input(
-            "Bearer token",
-            type="password",
-            placeholder="Configured in secrets or leave empty to use email/password",
-            key="eorigin_token",
-        )
-        c1, c2 = st.columns(2)
-        email_input = c1.text_input(
-            "E-Origin email",
-            placeholder="Configured in secrets" if read_secret("EORIGIN_EMAIL") else "Required if no token",
-            key="eorigin_email",
-        )
-        password_input = c2.text_input(
-            "E-Origin password",
-            type="password",
-            placeholder="Configured in secrets" if read_secret("EORIGIN_PASSWORD") else "Required if no token",
-            key="eorigin_password",
-        )
+        with st.form("eorigin_upload_form"):
+            batch_name = st.text_input("Batch name", key="eorigin_batch_name")
 
-        customer_id = customer_id_input.strip() or read_secret("EORIGIN_CUSTOMER_ID")
-        template_id = template_id_input.strip() or read_secret("EORIGIN_TEMPLATE_ID")
-        token = token_input.strip() or read_secret("EORIGIN_TOKEN")
-        email = email_input.strip() or read_secret("EORIGIN_EMAIL")
-        password = password_input or read_secret("EORIGIN_PASSWORD")
+            email_input = ""
+            password_input = ""
+            if has_saved_login:
+                st.caption("E-Origin login is configured in Streamlit secrets.")
+            else:
+                st.warning("E-Origin login is not configured in Streamlit secrets. Fill it here for this upload.")
+                c1, c2 = st.columns(2)
+                email_input = c1.text_input("E-Origin email", key="eorigin_email")
+                password_input = c2.text_input("E-Origin password", type="password", key="eorigin_password")
 
-        if st.button("Upload modified invoices to E-Origin", type="primary"):
+            submit_upload = st.form_submit_button("Upload modified invoices to E-Origin", type="primary")
+
+        token = saved_token
+        email = saved_email or email_input.strip()
+        password = saved_password or password_input
+
+        if submit_upload:
             missing = []
             if not batch_name.strip():
                 missing.append("Batch name")
-            if not customer_id:
-                missing.append("Customer ID")
-            if not template_id:
-                missing.append("Template ID")
             if not token and (not email or not password):
-                missing.append("Bearer token or E-Origin email/password")
+                missing.append("E-Origin email/password")
 
             if missing:
                 st.error("Missing: " + ", ".join(missing))
@@ -2706,8 +2804,6 @@ def render_eorigin_upload_box(processing, default_batch_name):
                         upload_result = upload_modified_invoices_to_eorigin(
                             modified_files=processing["modified_files"],
                             batch_name=batch_name.strip(),
-                            customer_id=customer_id,
-                            template_id=template_id,
                             token=token,
                             email=email,
                             password=password,
@@ -2722,6 +2818,37 @@ def render_eorigin_upload_box(processing, default_batch_name):
         upload_result = st.session_state.get("eorigin_upload_result")
         if upload_result:
             st.success(f"Last upload: {upload_result['message']}")
+
+
+def render_success_output(result, processing, zip_bytes):
+    st.subheader("Output")
+    st.dataframe(processing["modification_df"], use_container_width=True, hide_index=True)
+
+    st.subheader("VAT Charge")
+    st.caption(
+        f"Mode: {VAT_MODE} | Base: {VAT_BASE_AMOUNT} + THC {result['thc']} = {processing['vat_base']} | "
+        f"Total gross: {processing['vat_total_gross']} | Coefficient: {processing['vat_coefficient']}"
+    )
+    st.dataframe(processing["vat_df"], use_container_width=True, hide_index=True)
+
+    if processing["modified_files"]:
+        c1, c2 = st.columns(2)
+        c1.download_button(
+            "Download modified invoices ZIP",
+            data=zip_bytes,
+            file_name="EORIGIN_modified_invoices.zip",
+            mime="application/zip",
+            type="primary",
+        )
+        c2.download_button(
+            f"Download {VAT_CSV_NAME}",
+            data=processing["vat_csv_bytes"],
+            file_name=VAT_CSV_NAME,
+            mime="text/csv",
+        )
+        render_eorigin_upload_box(processing, batch_name_from_modified_files(processing["modified_files"]))
+    else:
+        st.error("No invoice was modified.")
 
 
 def build_summary_frames(check_results):
@@ -2818,11 +2945,29 @@ def main():
 
     allow_errors = st.checkbox("Allow output even if Final Check has errors", value=False)
     run = st.button("Run full processing", type="primary")
+    processing_signature = current_processing_signature(
+        invoice_files,
+        t1_pdf,
+        ship_name,
+        thc_text,
+        mrn_override,
+        date_override,
+        allow_errors,
+    )
 
     if not run:
-        st.info("Upload the invoice files and the T1 PDF to start.")
+        cached_output = st.session_state.get(EORIGIN_STATE_KEY)
+        if cached_output and cached_output.get("signature") == processing_signature:
+            render_success_output(
+                cached_output["result"],
+                cached_output["processing"],
+                cached_output["zip_bytes"],
+            )
+        else:
+            st.info("Upload the invoice files and the T1 PDF to start.")
         return
 
+    st.session_state.pop("eorigin_upload_result", None)
     if not invoice_files:
         st.error("Upload at least one invoice Excel file.")
         return
@@ -2971,38 +3116,17 @@ def main():
             )
             report_bytes = build_report_workbook(final_check_df, issue_df, t1_df, analysis, processing, rename_df)
             zip_bytes = build_zip(processing["modified_files"], report_bytes, processing["vat_csv_bytes"])
+            st.session_state[EORIGIN_STATE_KEY] = {
+                "signature": processing_signature,
+                "result": result,
+                "processing": processing,
+                "zip_bytes": zip_bytes,
+            }
     except Exception as exc:
         st.error(f"Modification error: {exc}")
         return
 
-    st.subheader("Output")
-    st.dataframe(processing["modification_df"], use_container_width=True, hide_index=True)
-    st.subheader("VAT Charge")
-    st.caption(
-        f"Mode: {VAT_MODE} | Base: {VAT_BASE_AMOUNT} + THC {result['thc']} = {processing['vat_base']} | "
-        f"Total gross: {processing['vat_total_gross']} | Coefficient: {processing['vat_coefficient']}"
-    )
-    st.dataframe(processing["vat_df"], use_container_width=True, hide_index=True)
-
-    if processing["modified_files"]:
-        c1, c2 = st.columns(2)
-        c1.download_button(
-            "Download modified invoices ZIP",
-            data=zip_bytes,
-            file_name="EORIGIN_modified_invoices.zip",
-            mime="application/zip",
-            type="primary",
-        )
-        c2.download_button(
-            f"Download {VAT_CSV_NAME}",
-            data=processing["vat_csv_bytes"],
-            file_name=VAT_CSV_NAME,
-            mime="text/csv",
-        )
-        default_batch_name = f"E-Origin {result['mrn'] or time.strftime('%Y%m%d-%H%M%S')}"
-        render_eorigin_upload_box(processing, default_batch_name)
-    else:
-        st.error("No invoice was modified.")
+    render_success_output(result, processing, zip_bytes)
 
 
 if __name__ == "__main__":

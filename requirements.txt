@@ -1,6 +1,5 @@
 streamlit
 pandas
 openpyxl
-pymupdf
-pdfplumber
 requests
+pillow

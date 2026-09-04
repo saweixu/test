@@ -32,8 +32,16 @@ VIES_RETRY_BASE_DELAY = 4  # seconds
 VIES_SLOW_COUNTRY_TIMEOUTS = {"FR": 120}
 VIES_SLOW_COUNTRY_RETRIES = {"FR": 1}
 VIES_SLOW_COUNTRY_BASE_DELAYS = {"FR": 8}
-VIES_FR_RECOVERY_WAIT_SECONDS = 45
+VIES_FR_RECOVERY_WAIT_SECONDS = 90
+VIES_FR_BETWEEN_REQUESTS_SECONDS = 20
 VIES_FINAL_INPUT_ERRORS = {"INVALID_INPUT_COUNTRY", "INVALID_INPUT_VAT"}
+VIES_RATE_LIMIT_ERRORS = {
+    "GLOBAL_MAX_CONCURRENT_REQ",
+    "MS_MAX_CONCURRENT_REQ",
+    "MS_UNAVAILABLE",
+    "SERVICE_UNAVAILABLE",
+    "SERVER_BUSY",
+}
 
 # VAT blacklist interne
 BLACKLISTED_VATS = {
@@ -77,6 +85,13 @@ def safe_filename(text: str) -> str:
     text = re.sub(r'[\\/*?:"<>|]+', "_", text)
     text = text.strip(" .")
     return text or "file"
+
+
+def natural_sort_key(text: str):
+    return [
+        int(part) if part.isdigit() else part.lower()
+        for part in re.split(r"(\d+)", clean_text(text))
+    ]
 
 
 def split_country_and_vat(raw: str) -> Tuple[str, str]:
@@ -242,7 +257,22 @@ def normalize_vies_error(error: str) -> str:
     error = clean_text(error)
     if not error:
         return "UNKNOWN_ERROR"
+    codes = vies_error_codes(error)
+    for code in VIES_FINAL_INPUT_ERRORS | VIES_RATE_LIMIT_ERRORS:
+        if code in codes:
+            return code
     return error.split(":", 1)[0].strip().upper()
+
+
+def vies_error_codes(error: str) -> set[str]:
+    text = clean_text(error).upper()
+    if not text:
+        return set()
+    return set(re.findall(r"\b[A-Z][A-Z0-9_]{2,}\b", text))
+
+
+def is_vies_rate_limit_error(error: str) -> bool:
+    return bool(vies_error_codes(error) & VIES_RATE_LIMIT_ERRORS)
 
 
 def parse_vies_rest_error(data: Dict) -> str:
@@ -375,6 +405,8 @@ def check_vat_once(country_code: str, vat_number: str) -> Dict:
     rest_error_code = normalize_vies_error(rest_result.get("error"))
     if rest_error_code in VIES_FINAL_INPUT_ERRORS:
         return rest_result
+    if is_vies_rate_limit_error(rest_result.get("error")):
+        return rest_result
 
     soap_result = check_vat_soap_once(country_code, vat_number)
     if soap_result.get("ok"):
@@ -459,7 +491,7 @@ def apply_vat_result_to_matching_rows(results: List[Dict], vat_key: Tuple[str, s
     return updated
 
 
-def retry_french_vat_errors(results: List[Dict], vat_cache: Dict, status_box) -> int:
+def retry_french_vat_errors(results: List[Dict], vat_cache: Dict, status_box) -> Dict:
     candidates = []
     seen = set()
 
@@ -478,7 +510,7 @@ def retry_french_vat_errors(results: List[Dict], vat_cache: Dict, status_box) ->
         candidates.append((vat_key, source))
 
     if not candidates:
-        return 0
+        return {"processed": 0, "recovered": 0}
 
     status_box.write(
         f"French VAT temporary errors detected. Waiting {VIES_FR_RECOVERY_WAIT_SECONDS}s before retry."
@@ -489,6 +521,12 @@ def retry_french_vat_errors(results: List[Dict], vat_cache: Dict, status_box) ->
     total = len(candidates)
 
     for index, (vat_key, source) in enumerate(candidates, start=1):
+        if index > 1:
+            status_box.write(
+                f"Waiting {VIES_FR_BETWEEN_REQUESTS_SECONDS}s before next French VAT request."
+            )
+            time.sleep(VIES_FR_BETWEEN_REQUESTS_SECONDS)
+
         status_box.write(
             f"French VAT retry {index}/{total}: {source['file']} -> {source['vat']}"
         )
@@ -505,7 +543,7 @@ def retry_french_vat_errors(results: List[Dict], vat_cache: Dict, status_box) ->
         if retry_result.get("ok"):
             recovered += updated
 
-    return recovered
+    return {"processed": len(candidates), "recovered": recovered}
 
 
 # =========================================================
@@ -940,14 +978,11 @@ def results_to_dataframe(results: List[Dict]) -> pd.DataFrame:
 def display_results_dataframe(summary_df: pd.DataFrame):
     columns = [
         "file",
-        "company_name",
         "vat",
         "vat_status",
         "vat_error",
-        "vat_attempts",
         "vat_method",
         "vat_from_cache",
-        "eori",
         "eori_status",
         "eori_error",
     ]
@@ -1005,6 +1040,9 @@ if uploaded_files:
             parsed_rows.append(extracted)
         else:
             extract_errors.append(extracted)
+
+    parsed_rows = sorted(parsed_rows, key=lambda row: natural_sort_key(row["file"]))
+    extract_errors = sorted(extract_errors, key=lambda row: natural_sort_key(row.get("file", "")))
 
     st.subheader("Aperçu extraction")
     if parsed_rows:
@@ -1114,8 +1152,9 @@ if uploaded_files:
 
             progress.progress(i / total)
 
-        recovered_fr = retry_french_vat_errors(results, vat_cache, status_box)
-        if recovered_fr:
+        fr_retry = retry_french_vat_errors(results, vat_cache, status_box)
+        if fr_retry["processed"]:
+            recovered_fr = fr_retry["recovered"]
             status_box.success(f"French VAT retry recovered {recovered_fr} result(s).")
             vat_images = []
             for item in results:

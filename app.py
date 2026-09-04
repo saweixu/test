@@ -17,20 +17,27 @@ from xml.etree import ElementTree as ET
 # =========================================================
 APP_TITLE = "VIES + EORI Checker with screenshots"
 
-VIES_SOAP_URL = "http://ec.europa.eu/taxation_customs/vies/services/checkVatService"
+VIES_REST_URL = "https://ec.europa.eu/taxation_customs/vies/rest-api/check-vat-number"
+VIES_SOAP_URL = "https://ec.europa.eu/taxation_customs/vies/services/checkVatService"
 EORI_SOAP_URL = "https://ec.europa.eu/taxation_customs/dds2/eos/validation/services/validation"
 
 REQUEST_TIMEOUT = 45
+VIES_CONNECT_TIMEOUT = 12
 
 SOAP_ENV_NS = "http://schemas.xmlsoap.org/soap/envelope/"
 
 # Retry VAT / VIES
-VIES_MAX_RETRIES = 8
-VIES_RETRY_BASE_DELAY = 3  # seconds
-VIES_SLOW_COUNTRY_TIMEOUTS = {"FR": 90}
-VIES_SLOW_COUNTRY_RETRIES = {"FR": 12}
-VIES_SLOW_COUNTRY_BASE_DELAYS = {"FR": 5}
+VIES_MAX_RETRIES = 3
+VIES_RETRY_BASE_DELAY = 4  # seconds
+VIES_SLOW_COUNTRY_TIMEOUTS = {"FR": 120}
+VIES_SLOW_COUNTRY_RETRIES = {"FR": 3}
+VIES_SLOW_COUNTRY_BASE_DELAYS = {"FR": 8}
 VIES_FINAL_INPUT_ERRORS = {"INVALID_INPUT_COUNTRY", "INVALID_INPUT_VAT"}
+VIES_SOAP_FALLBACK_ERRORS = {
+    "INVALID_JSON_RESPONSE",
+    "REST_INVALID_RESPONSE",
+    "REST_UNEXPECTED_ERROR",
+}
 
 # VAT blacklist interne
 BLACKLISTED_VATS = {
@@ -223,6 +230,10 @@ def vies_timeout(country_code: str) -> int:
     return VIES_SLOW_COUNTRY_TIMEOUTS.get(country_code, REQUEST_TIMEOUT)
 
 
+def vies_request_timeout(country_code: str) -> Tuple[int, int]:
+    return (VIES_CONNECT_TIMEOUT, vies_timeout(country_code))
+
+
 def vies_retry_settings(country_code: str) -> Tuple[int, int]:
     country_code = clean_text(country_code).upper()
     return (
@@ -231,13 +242,101 @@ def vies_retry_settings(country_code: str) -> Tuple[int, int]:
     )
 
 
-def check_vat_once(country_code: str, vat_number: str) -> Dict:
-    if not re.fullmatch(r"[A-Z]{2}", country_code or ""):
-        return {"ok": False, "error": "INVALID_INPUT_COUNTRY"}
+def normalize_vies_error(error: str) -> str:
+    error = clean_text(error)
+    if not error:
+        return "UNKNOWN_ERROR"
+    return error.split(":", 1)[0].strip().upper()
 
-    if not re.fullmatch(r"[0-9A-Za-z+*.]{2,12}", vat_number or ""):
-        return {"ok": False, "error": "INVALID_INPUT_VAT"}
 
+def parse_vies_rest_error(data: Dict) -> str:
+    wrappers = data.get("errorWrappers")
+    if isinstance(wrappers, list) and wrappers:
+        parts = []
+        for wrapper in wrappers:
+            if not isinstance(wrapper, dict):
+                continue
+            code = clean_text(wrapper.get("error"))
+            message = clean_text(wrapper.get("message"))
+            if code and message:
+                parts.append(f"{code}: {message}")
+            elif code:
+                parts.append(code)
+            elif message:
+                parts.append(message)
+        if parts:
+            return " | ".join(parts)
+
+    message = clean_text(data.get("message"))
+    if message:
+        return message
+
+    return "REST_INVALID_RESPONSE"
+
+
+def parse_vies_rest_response(data: Dict) -> Dict:
+    if data.get("actionSucceed") is False or "errorWrappers" in data:
+        return {"ok": False, "error": parse_vies_rest_error(data), "method": "REST"}
+
+    if "valid" not in data:
+        return {"ok": False, "error": "REST_INVALID_RESPONSE", "method": "REST"}
+
+    name = clean_text(data.get("name") or data.get("traderName"))
+    address = clean_text(data.get("address"))
+
+    return {
+        "ok": True,
+        "country_code": clean_text(data.get("countryCode")),
+        "vat_number": clean_text(data.get("vatNumber")),
+        "request_date": clean_text(data.get("requestDate")),
+        "valid": data.get("valid") is True,
+        "name": "" if name == "---" else name,
+        "address": "" if address == "---" else address,
+        "method": "REST",
+    }
+
+
+def check_vat_rest_once(country_code: str, vat_number: str) -> Dict:
+    headers = {
+        "Accept": "application/json",
+        "Content-Type": "application/json",
+        "User-Agent": "VAT-EORI-Checker/1.0",
+    }
+    payload = {
+        "countryCode": country_code,
+        "vatNumber": vat_number,
+    }
+
+    try:
+        response = requests.post(
+            VIES_REST_URL,
+            json=payload,
+            headers=headers,
+            timeout=vies_request_timeout(country_code),
+        )
+
+        try:
+            data = response.json()
+        except ValueError:
+            if response.ok:
+                return {"ok": False, "error": "INVALID_JSON_RESPONSE", "method": "REST"}
+            return {"ok": False, "error": f"HTTP_{response.status_code}", "method": "REST"}
+
+        if not response.ok:
+            error = parse_vies_rest_error(data)
+            return {"ok": False, "error": error or f"HTTP_{response.status_code}", "method": "REST"}
+
+        return parse_vies_rest_response(data)
+
+    except requests.Timeout:
+        return {"ok": False, "error": "TIMEOUT", "method": "REST"}
+    except requests.RequestException as exc:
+        return {"ok": False, "error": f"HTTP_ERROR: {exc}", "method": "REST"}
+    except Exception as exc:
+        return {"ok": False, "error": f"REST_UNEXPECTED_ERROR: {exc}", "method": "REST"}
+
+
+def check_vat_soap_once(country_code: str, vat_number: str) -> Dict:
     headers = {
         "Content-Type": "text/xml; charset=utf-8",
         "SOAPAction": '""',
@@ -249,19 +348,49 @@ def check_vat_once(country_code: str, vat_number: str) -> Dict:
             VIES_SOAP_URL,
             data=build_vies_envelope(country_code, vat_number).encode("utf-8"),
             headers=headers,
-            timeout=vies_timeout(country_code),
+            timeout=vies_request_timeout(country_code),
         )
         response.raise_for_status()
-        return parse_vies_response(response.text)
+        result = parse_vies_response(response.text)
+        result["method"] = "SOAP"
+        return result
 
     except requests.Timeout:
-        return {"ok": False, "error": "TIMEOUT"}
+        return {"ok": False, "error": "TIMEOUT", "method": "SOAP"}
     except requests.RequestException as exc:
-        return {"ok": False, "error": f"HTTP_ERROR: {exc}"}
+        return {"ok": False, "error": f"HTTP_ERROR: {exc}", "method": "SOAP"}
     except ET.ParseError:
-        return {"ok": False, "error": "INVALID_XML_RESPONSE"}
+        return {"ok": False, "error": "INVALID_XML_RESPONSE", "method": "SOAP"}
     except Exception as exc:
-        return {"ok": False, "error": f"UNEXPECTED_ERROR: {exc}"}
+        return {"ok": False, "error": f"UNEXPECTED_ERROR: {exc}", "method": "SOAP"}
+
+
+def check_vat_once(country_code: str, vat_number: str) -> Dict:
+    if not re.fullmatch(r"[A-Z]{2}", country_code or ""):
+        return {"ok": False, "error": "INVALID_INPUT_COUNTRY"}
+
+    if not re.fullmatch(r"[0-9A-Za-z+*.]{2,12}", vat_number or ""):
+        return {"ok": False, "error": "INVALID_INPUT_VAT"}
+
+    rest_result = check_vat_rest_once(country_code, vat_number)
+    if rest_result.get("ok"):
+        return rest_result
+
+    rest_error_code = normalize_vies_error(rest_result.get("error"))
+    if rest_error_code in VIES_FINAL_INPUT_ERRORS:
+        return rest_result
+
+    if rest_error_code in VIES_SOAP_FALLBACK_ERRORS:
+        soap_result = check_vat_soap_once(country_code, vat_number)
+        if soap_result.get("ok"):
+            return soap_result
+        return {
+            "ok": False,
+            "error": f"REST {rest_result.get('error', 'UNKNOWN')} | SOAP {soap_result.get('error', 'UNKNOWN')}",
+            "method": "REST+SOAP",
+        }
+
+    return rest_result
 
 
 def check_vat_with_retry(country_code: str, vat_number: str, max_retries: int = None, status_callback=None) -> Dict:
@@ -288,7 +417,7 @@ def check_vat_with_retry(country_code: str, vat_number: str, max_retries: int = 
             return result
 
         # Si input invalide -> inutile de retry
-        err = clean_text(result.get("error")).upper()
+        err = normalize_vies_error(result.get("error"))
         if err in VIES_FINAL_INPUT_ERRORS:
             return result
 
@@ -706,12 +835,15 @@ def results_to_dataframe(results: List[Dict]) -> pd.DataFrame:
             "blacklist_alert": source.get("blacklist_alert", ""),
             "vat_status": vat_status,
             "vat_attempts": vat_attempts,
+            "vat_method": vat_result.get("method", ""),
+            "vat_from_cache": "YES" if vat_result.get("from_cache") else "",
             "vat_request_date": vat_result.get("request_date", ""),
             "vat_name": vat_result.get("name", ""),
             "vat_address": vat_result.get("address", ""),
             "vat_error": "" if vat_result.get("ok") else vat_result.get("error", ""),
             "eori": source.get("eori", ""),
             "eori_status": eori_status,
+            "eori_from_cache": "YES" if eori_result.get("from_cache") else "",
             "eori_request_date": eori_result.get("request_date", ""),
             "eori_status_descr": eori_result.get("status_descr", ""),
             "eori_name": eori_result.get("name", ""),
@@ -807,6 +939,8 @@ if uploaded_files:
         results = []
         vat_images = []
         eori_images = []
+        vat_cache = {}
+        eori_cache = {}
 
         progress = st.progress(0)
         status_box = st.empty()
@@ -829,14 +963,30 @@ if uploaded_files:
                         f"after {wait_seconds}s ({error}) | EORI {row['eori']}"
                     )
 
-            vat_result = check_vat_with_retry(
-                row["country_code"],
-                row["vat_number"],
-                status_callback=update_vat_status,
-            )
+            vat_key = (row["country_code"], row["vat_number"])
+            if vat_key in vat_cache:
+                vat_result = dict(vat_cache[vat_key])
+                vat_result["from_cache"] = True
+                status_box.write(
+                    f"Traitement {i}/{total} : {row['file']} -> VAT reused from cache | EORI {row['eori']}"
+                )
+            else:
+                vat_result = check_vat_with_retry(
+                    row["country_code"],
+                    row["vat_number"],
+                    status_callback=update_vat_status,
+                )
+                vat_cache[vat_key] = dict(vat_result)
+
             vat_attempts = vat_result.get("attempts", 1)
 
-            eori_result = check_eori(row["eori"])
+            eori_key = row["eori"]
+            if eori_key in eori_cache:
+                eori_result = dict(eori_cache[eori_key])
+                eori_result["from_cache"] = True
+            else:
+                eori_result = check_eori(row["eori"])
+                eori_cache[eori_key] = dict(eori_result)
 
             results.append({
                 "source": row,

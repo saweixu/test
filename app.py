@@ -30,14 +30,10 @@ SOAP_ENV_NS = "http://schemas.xmlsoap.org/soap/envelope/"
 VIES_MAX_RETRIES = 3
 VIES_RETRY_BASE_DELAY = 4  # seconds
 VIES_SLOW_COUNTRY_TIMEOUTS = {"FR": 120}
-VIES_SLOW_COUNTRY_RETRIES = {"FR": 3}
+VIES_SLOW_COUNTRY_RETRIES = {"FR": 1}
 VIES_SLOW_COUNTRY_BASE_DELAYS = {"FR": 8}
+VIES_FR_RECOVERY_WAIT_SECONDS = 45
 VIES_FINAL_INPUT_ERRORS = {"INVALID_INPUT_COUNTRY", "INVALID_INPUT_VAT"}
-VIES_SOAP_FALLBACK_ERRORS = {
-    "INVALID_JSON_RESPONSE",
-    "REST_INVALID_RESPONSE",
-    "REST_UNEXPECTED_ERROR",
-}
 
 # VAT blacklist interne
 BLACKLISTED_VATS = {
@@ -380,17 +376,15 @@ def check_vat_once(country_code: str, vat_number: str) -> Dict:
     if rest_error_code in VIES_FINAL_INPUT_ERRORS:
         return rest_result
 
-    if rest_error_code in VIES_SOAP_FALLBACK_ERRORS:
-        soap_result = check_vat_soap_once(country_code, vat_number)
-        if soap_result.get("ok"):
-            return soap_result
-        return {
-            "ok": False,
-            "error": f"REST {rest_result.get('error', 'UNKNOWN')} | SOAP {soap_result.get('error', 'UNKNOWN')}",
-            "method": "REST+SOAP",
-        }
+    soap_result = check_vat_soap_once(country_code, vat_number)
+    if soap_result.get("ok"):
+        return soap_result
 
-    return rest_result
+    return {
+        "ok": False,
+        "error": f"REST {rest_result.get('error', 'UNKNOWN')} | SOAP {soap_result.get('error', 'UNKNOWN')}",
+        "method": "REST+SOAP",
+    }
 
 
 def check_vat_with_retry(country_code: str, vat_number: str, max_retries: int = None, status_callback=None) -> Dict:
@@ -429,6 +423,89 @@ def check_vat_with_retry(country_code: str, vat_number: str, max_retries: int = 
             time.sleep(sleep_time)
 
     return last_result or {"ok": False, "error": "NO_RESPONSE", "attempts": 0}
+
+
+def is_final_vat_result(result: Dict) -> bool:
+    if result.get("ok"):
+        return True
+    return normalize_vies_error(result.get("error")) in VIES_FINAL_INPUT_ERRORS
+
+
+def is_retryable_vat_error(result: Dict) -> bool:
+    return not is_final_vat_result(result)
+
+
+def should_cache_vat_result(result: Dict) -> bool:
+    return is_final_vat_result(result)
+
+
+def vat_key_from_source(row: Dict) -> Tuple[str, str]:
+    return row["country_code"], row["vat_number"]
+
+
+def apply_vat_result_to_matching_rows(results: List[Dict], vat_key: Tuple[str, str], vat_result: Dict) -> int:
+    updated = 0
+    for item in results:
+        source = item["source"]
+        if vat_key_from_source(source) != vat_key:
+            continue
+
+        result_copy = dict(vat_result)
+        if updated:
+            result_copy["from_cache"] = True
+        item["vat_result"] = result_copy
+        item["vat_attempts"] = result_copy.get("attempts", item.get("vat_attempts", 1))
+        updated += 1
+    return updated
+
+
+def retry_french_vat_errors(results: List[Dict], vat_cache: Dict, status_box) -> int:
+    candidates = []
+    seen = set()
+
+    for item in results:
+        source = item["source"]
+        vat_result = item["vat_result"]
+        if source.get("country_code") != "FR":
+            continue
+        if not is_retryable_vat_error(vat_result):
+            continue
+
+        vat_key = vat_key_from_source(source)
+        if vat_key in seen:
+            continue
+        seen.add(vat_key)
+        candidates.append((vat_key, source))
+
+    if not candidates:
+        return 0
+
+    status_box.write(
+        f"French VAT temporary errors detected. Waiting {VIES_FR_RECOVERY_WAIT_SECONDS}s before retry."
+    )
+    time.sleep(VIES_FR_RECOVERY_WAIT_SECONDS)
+
+    recovered = 0
+    total = len(candidates)
+
+    for index, (vat_key, source) in enumerate(candidates, start=1):
+        status_box.write(
+            f"French VAT retry {index}/{total}: {source['file']} -> {source['vat']}"
+        )
+        retry_result = check_vat_with_retry(
+            source["country_code"],
+            source["vat_number"],
+            max_retries=1,
+        )
+
+        if should_cache_vat_result(retry_result):
+            vat_cache[vat_key] = dict(retry_result)
+
+        updated = apply_vat_result_to_matching_rows(results, vat_key, retry_result)
+        if retry_result.get("ok"):
+            recovered += updated
+
+    return recovered
 
 
 # =========================================================
@@ -818,9 +895,11 @@ def results_to_dataframe(results: List[Dict]) -> pd.DataFrame:
         eori_result = item["eori_result"]
         vat_attempts = item.get("vat_attempts", 1)
 
-        vat_status = "ERROR"
+        vat_status = "TEMP ERROR"
         if vat_result.get("ok"):
             vat_status = "VALID" if vat_result.get("valid") else "INVALID"
+        elif normalize_vies_error(vat_result.get("error")) in VIES_FINAL_INPUT_ERRORS:
+            vat_status = "ERROR"
 
         eori_status = "ERROR"
         if eori_result.get("ok"):
@@ -834,15 +913,16 @@ def results_to_dataframe(results: List[Dict]) -> pd.DataFrame:
             "vat_number": source.get("vat_number", ""),
             "blacklist_alert": source.get("blacklist_alert", ""),
             "vat_status": vat_status,
+            "vat_error": "" if vat_result.get("ok") else vat_result.get("error", ""),
             "vat_attempts": vat_attempts,
             "vat_method": vat_result.get("method", ""),
             "vat_from_cache": "YES" if vat_result.get("from_cache") else "",
             "vat_request_date": vat_result.get("request_date", ""),
             "vat_name": vat_result.get("name", ""),
             "vat_address": vat_result.get("address", ""),
-            "vat_error": "" if vat_result.get("ok") else vat_result.get("error", ""),
             "eori": source.get("eori", ""),
             "eori_status": eori_status,
+            "eori_error": "" if eori_result.get("ok") else eori_result.get("error", ""),
             "eori_from_cache": "YES" if eori_result.get("from_cache") else "",
             "eori_request_date": eori_result.get("request_date", ""),
             "eori_status_descr": eori_result.get("status_descr", ""),
@@ -852,10 +932,30 @@ def results_to_dataframe(results: List[Dict]) -> pd.DataFrame:
             "eori_postal_code": eori_result.get("postal_code", ""),
             "eori_city": eori_result.get("city", ""),
             "eori_country": eori_result.get("country", ""),
-            "eori_error": "" if eori_result.get("ok") else eori_result.get("error", ""),
         })
 
     return pd.DataFrame(rows)
+
+
+def display_results_dataframe(summary_df: pd.DataFrame):
+    columns = [
+        "file",
+        "company_name",
+        "vat",
+        "vat_status",
+        "vat_error",
+        "vat_attempts",
+        "vat_method",
+        "vat_from_cache",
+        "eori",
+        "eori_status",
+        "eori_error",
+    ]
+    visible_columns = [col for col in columns if col in summary_df.columns]
+    st.dataframe(summary_df[visible_columns], use_container_width=True)
+
+    with st.expander("Full result details"):
+        st.dataframe(summary_df, use_container_width=True)
 
 
 def make_zip(vat_images: List[Tuple[str, bytes]], eori_images: List[Tuple[str, bytes]], summary_df: pd.DataFrame) -> bytes:
@@ -976,7 +1076,8 @@ if uploaded_files:
                     row["vat_number"],
                     status_callback=update_vat_status,
                 )
-                vat_cache[vat_key] = dict(vat_result)
+                if should_cache_vat_result(vat_result):
+                    vat_cache[vat_key] = dict(vat_result)
 
             vat_attempts = vat_result.get("attempts", 1)
 
@@ -986,7 +1087,8 @@ if uploaded_files:
                 eori_result["from_cache"] = True
             else:
                 eori_result = check_eori(row["eori"])
-                eori_cache[eori_key] = dict(eori_result)
+                if eori_result.get("ok"):
+                    eori_cache[eori_key] = dict(eori_result)
 
             results.append({
                 "source": row,
@@ -1012,18 +1114,29 @@ if uploaded_files:
 
             progress.progress(i / total)
 
+        recovered_fr = retry_french_vat_errors(results, vat_cache, status_box)
+        if recovered_fr:
+            status_box.success(f"French VAT retry recovered {recovered_fr} result(s).")
+            vat_images = []
+            for item in results:
+                row = item["source"]
+                vat_img = render_vat_image(item["vat_result"], row)
+                base_name = safe_filename(row["file"].rsplit(".", 1)[0])
+                vat_images.append((f"{base_name}_VAT.png", vat_img))
+
         status_box.success("Traitement terminé.")
 
         summary_df = results_to_dataframe(results)
 
         st.subheader("Résultats")
-        st.dataframe(summary_df, use_container_width=True)
+        display_results_dataframe(summary_df)
 
-        c1, c2, c3, c4 = st.columns(4)
+        c1, c2, c3, c4, c5 = st.columns(5)
         c1.metric("VAT VALID", int((summary_df["vat_status"] == "VALID").sum()))
-        c2.metric("VAT ERROR/INVALID", int((summary_df["vat_status"] != "VALID").sum()))
-        c3.metric("EORI VALID", int((summary_df["eori_status"] == "VALID").sum()))
-        c4.metric("EORI ERROR/INVALID", int((summary_df["eori_status"] != "VALID").sum()))
+        c2.metric("VAT INVALID", int((summary_df["vat_status"] == "INVALID").sum()))
+        c3.metric("VAT TEMP ERROR", int((summary_df["vat_status"] == "TEMP ERROR").sum()))
+        c4.metric("EORI VALID", int((summary_df["eori_status"] == "VALID").sum()))
+        c5.metric("EORI ERROR/INVALID", int((summary_df["eori_status"] != "VALID").sum()))
 
         zip_bytes = make_zip(vat_images, eori_images, summary_df)
 

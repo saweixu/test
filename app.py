@@ -20,13 +20,17 @@ APP_TITLE = "VIES + EORI Checker with screenshots"
 VIES_SOAP_URL = "http://ec.europa.eu/taxation_customs/vies/services/checkVatService"
 EORI_SOAP_URL = "https://ec.europa.eu/taxation_customs/dds2/eos/validation/services/validation"
 
-REQUEST_TIMEOUT = 35
+REQUEST_TIMEOUT = 45
 
 SOAP_ENV_NS = "http://schemas.xmlsoap.org/soap/envelope/"
 
 # Retry VAT / VIES
 VIES_MAX_RETRIES = 8
-VIES_RETRY_BASE_DELAY = 2  # secondes
+VIES_RETRY_BASE_DELAY = 3  # seconds
+VIES_SLOW_COUNTRY_TIMEOUTS = {"FR": 90}
+VIES_SLOW_COUNTRY_RETRIES = {"FR": 12}
+VIES_SLOW_COUNTRY_BASE_DELAYS = {"FR": 5}
+VIES_FINAL_INPUT_ERRORS = {"INVALID_INPUT_COUNTRY", "INVALID_INPUT_VAT"}
 
 # VAT blacklist interne
 BLACKLISTED_VATS = {
@@ -214,6 +218,19 @@ def parse_vies_response(xml_text: str) -> Dict:
     }
 
 
+def vies_timeout(country_code: str) -> int:
+    country_code = clean_text(country_code).upper()
+    return VIES_SLOW_COUNTRY_TIMEOUTS.get(country_code, REQUEST_TIMEOUT)
+
+
+def vies_retry_settings(country_code: str) -> Tuple[int, int]:
+    country_code = clean_text(country_code).upper()
+    return (
+        VIES_SLOW_COUNTRY_RETRIES.get(country_code, VIES_MAX_RETRIES),
+        VIES_SLOW_COUNTRY_BASE_DELAYS.get(country_code, VIES_RETRY_BASE_DELAY),
+    )
+
+
 def check_vat_once(country_code: str, vat_number: str) -> Dict:
     if not re.fullmatch(r"[A-Z]{2}", country_code or ""):
         return {"ok": False, "error": "INVALID_INPUT_COUNTRY"}
@@ -232,7 +249,7 @@ def check_vat_once(country_code: str, vat_number: str) -> Dict:
             VIES_SOAP_URL,
             data=build_vies_envelope(country_code, vat_number).encode("utf-8"),
             headers=headers,
-            timeout=REQUEST_TIMEOUT,
+            timeout=vies_timeout(country_code),
         )
         response.raise_for_status()
         return parse_vies_response(response.text)
@@ -247,17 +264,23 @@ def check_vat_once(country_code: str, vat_number: str) -> Dict:
         return {"ok": False, "error": f"UNEXPECTED_ERROR: {exc}"}
 
 
-def check_vat_with_retry(country_code: str, vat_number: str, max_retries: int = VIES_MAX_RETRIES) -> Dict:
+def check_vat_with_retry(country_code: str, vat_number: str, max_retries: int = None, status_callback=None) -> Dict:
     """
     Règle :
     - VALID   -> stop
     - INVALID -> stop
     - ERROR   -> retry
     """
+    default_retries, base_delay = vies_retry_settings(country_code)
+    max_retries = max_retries or default_retries
     last_result = None
 
     for attempt in range(1, max_retries + 1):
+        if status_callback:
+            status_callback("checking", attempt, max_retries, "", 0)
+
         result = check_vat_once(country_code, vat_number)
+        result["attempts"] = attempt
         last_result = result
 
         # Si réponse propre de VIES -> on stop directement
@@ -266,15 +289,17 @@ def check_vat_with_retry(country_code: str, vat_number: str, max_retries: int = 
 
         # Si input invalide -> inutile de retry
         err = clean_text(result.get("error")).upper()
-        if err in {"INVALID_INPUT_COUNTRY", "INVALID_INPUT_VAT"}:
+        if err in VIES_FINAL_INPUT_ERRORS:
             return result
 
         # Sinon erreur VIES/réseau/XML -> retry
         if attempt < max_retries:
-            sleep_time = VIES_RETRY_BASE_DELAY * attempt
+            sleep_time = base_delay * attempt
+            if status_callback:
+                status_callback("waiting", attempt, max_retries, err, sleep_time)
             time.sleep(sleep_time)
 
-    return last_result
+    return last_result or {"ok": False, "error": "NO_RESPONSE", "attempts": 0}
 
 
 # =========================================================
@@ -793,29 +818,23 @@ if uploaded_files:
                 f"Traitement {i}/{total} : {row['file']} -> VAT {row['vat']} | EORI {row['eori']}"
             )
 
-            # VAT avec retry automatique si ERROR
-            vat_result = None
-            vat_attempts = 0
-
-            for attempt in range(1, VIES_MAX_RETRIES + 1):
-                vat_attempts = attempt
-                vat_result = check_vat_once(row["country_code"], row["vat_number"])
-
-                if vat_result.get("ok"):
-                    break
-
-                err = clean_text(vat_result.get("error")).upper()
-
-                # Erreur input -> pas de retry
-                if err in {"INVALID_INPUT_COUNTRY", "INVALID_INPUT_VAT"}:
-                    break
-
-                # Retry uniquement si erreur système / VIES instable
-                if attempt < VIES_MAX_RETRIES:
+            def update_vat_status(phase, attempt, max_retries, error, wait_seconds):
+                if phase == "checking":
                     status_box.write(
-                        f"Traitement {i}/{total} : {row['file']} -> VAT retry {attempt}/{VIES_MAX_RETRIES} ({err}) | EORI {row['eori']}"
+                        f"Traitement {i}/{total} : {row['file']} -> VAT attempt {attempt}/{max_retries} | EORI {row['eori']}"
                     )
-                    time.sleep(VIES_RETRY_BASE_DELAY * attempt)
+                else:
+                    status_box.write(
+                        f"Traitement {i}/{total} : {row['file']} -> VAT retry {attempt}/{max_retries} "
+                        f"after {wait_seconds}s ({error}) | EORI {row['eori']}"
+                    )
+
+            vat_result = check_vat_with_retry(
+                row["country_code"],
+                row["vat_number"],
+                status_callback=update_vat_status,
+            )
+            vat_attempts = vat_result.get("attempts", 1)
 
             eori_result = check_eori(row["eori"])
 

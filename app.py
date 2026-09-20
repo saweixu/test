@@ -13,6 +13,7 @@ from typing import Iterable
 
 CONTAINER_RE = re.compile(r"\b([A-Z]{4}\s?\d{7})\b")
 BL_TOKEN_RE = re.compile(r"\b(?:[A-Z]{2,5}\d{5,12}|\d{8,12})\b")
+VERIFY_TYPE = "A verifier"
 
 
 @dataclass
@@ -210,24 +211,27 @@ def classify_document_type(text: str) -> str:
     ):
         types.append("Storage")
 
-    if "DEMURRAGE" in upper or "DEM/DET" in upper:
-        types.append("Demurrage")
-    elif "DETENTION" in upper:
+    is_detention = "DETENTION" in upper and (
+        "DETENTION IMPORT CHARGE" in upper
+        or "IMPORT DETENTION" in upper
+        or ("GATE OUT FULL" in upper and "GATE IN EMPTY" in upper)
+    )
+    if is_detention:
+        types.append("Detention")
+    elif "DEMURRAGE/DETENTION" in upper or "DEM/DET" in upper:
+        types.extend(["Demurrage", "Detention"])
+    elif "DEMURRAGE" in upper:
         types.append("Demurrage")
 
     if any(term in upper for term in ["DEST TRML HANDLG", "TERMINAL HANDLING", "DTHC", "TRML HANDLG"]):
         types.append("THC")
 
-    if not types and "FREIGHT" in upper:
-        types.append("Freight")
     if not types and "SECURE RELEASE FEE" in upper:
         types.append("Release")
-    if not types and "MISC CHARGES" in upper:
-        types.append("Misc")
 
-    preferred_order = ["Storage", "Demurrage", "THC", "Freight", "Release", "Misc"]
+    preferred_order = ["Storage", "Demurrage", "Detention", "THC", "Release"]
     ordered = [item for item in preferred_order if item in set(types)]
-    return "-".join(ordered) if ordered else "Other"
+    return "-".join(ordered) if ordered else VERIFY_TYPE
 
 
 def parse_amount(value: str) -> str:
@@ -301,9 +305,9 @@ def confidence_label(result: dict[str, str]) -> str:
     score += 20 if result["bl_number"] else 0
     score += 20 if result["invoice_number"] else 0
     score += 20 if result["amount"] else 0
-    score += 15 if result["document_type"] and result["document_type"] != "Other" else 0
+    score += 15 if result["document_type"] and result["document_type"] != VERIFY_TYPE else 0
 
-    if score >= 85:
+    if score >= 85 and result["document_type"] != VERIFY_TYPE:
         return "High"
     if score >= 60:
         return "Medium"
@@ -318,7 +322,7 @@ def parse_invoice(text: str, file_name: str) -> InvoiceResult:
             container_number="",
             bl_number="",
             invoice_number=extract_invoice_number("", file_name),
-            document_type="Other",
+            document_type=VERIFY_TYPE,
             currency="",
             amount="",
             proposed_name=f"{safe_filename_part(Path(file_name).stem)}-Unreadable.pdf",
@@ -350,7 +354,7 @@ def parse_invoice(text: str, file_name: str) -> InvoiceResult:
         notes.append("Facture non trouvee")
     if not payload["amount"]:
         notes.append("Montant non trouve")
-    if payload["document_type"] == "Other":
+    if payload["document_type"] == VERIFY_TYPE:
         notes.append("Type a verifier")
 
     return InvoiceResult(**payload, notes="; ".join(notes))

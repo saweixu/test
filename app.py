@@ -151,6 +151,8 @@ def extract_shipping_line(text: str) -> str:
         or re.search(r"\bINVOICE\s+NUMBER\s*:\s*SA\d+", upper)
     ):
         return "Sharer"
+    if "SAVVY HAVEN" in upper:
+        return "Savvy Haven"
     if "CMA - CGM" in upper or "CMA CGM" in upper:
         return "CMA CGM"
     if "EVERGREEN SHIPPING" in upper or "EVERGREEN LINE" in upper:
@@ -189,6 +191,10 @@ def extract_invoice_number(text: str, file_name: str) -> str:
 
 
 def extract_bl_number(text: str) -> str:
+    master_bl_match = re.search(r"\bM/?BL\s+NO\.?\s*[:：]\s*([A-Z0-9-]+)", text, re.IGNORECASE)
+    if master_bl_match:
+        return master_bl_match.group(1).strip()
+
     evergreen_match = re.search(r"\bB/L\s*(?:(?:NR|NO)\.?\s*:|:)\s*([A-Z0-9-]+)", text, re.IGNORECASE)
     if evergreen_match:
         return evergreen_match.group(1).strip()
@@ -223,7 +229,7 @@ def extract_bl_number(text: str) -> str:
         if tokens:
             return tokens[-1].strip()
 
-    fallback = re.search(r"\bB/?L\s*(?:NO\.?|NUMBER)?\s*:?\s*([A-Z0-9-]+)", text, re.IGNORECASE)
+    fallback = re.search(r"\bB/?L\s*(?:NO\.?|NUMBER)?\s*[:：]\s*([A-Z0-9-]+)", text, re.IGNORECASE)
     if fallback:
         return fallback.group(1).strip()
     return ""
@@ -270,6 +276,8 @@ def classify_document_type(text: str) -> str:
         types.append("Customs-Insp")
     if not types and "YARD OCCUPANCY CHARGE" in upper:
         types.append("YOC")
+    if not types and re.search(r"\bMISC(?:ELLANEOUS)?\s+CHARGES?\b", upper):
+        types.append("Misc-Charges")
 
     preferred_order = [
         "Storage",
@@ -280,6 +288,7 @@ def classify_document_type(text: str) -> str:
         "Destination-Coord-Service",
         "Customs-Insp",
         "YOC",
+        "Misc-Charges",
     ]
     ordered = [item for item in preferred_order if item in set(types)]
     return "-".join(ordered) if ordered else VERIFY_TYPE
@@ -309,6 +318,7 @@ def extract_amount(text: str) -> tuple[str, str]:
             return "EUR", parse_amount(match.group(2) or match.group(1))
 
     patterns = [
+        r"TOTAL\s*[:：]\s*([A-Z]{3})\s+([0-9][0-9.,]*)",
         r"TOTAL\s+PAYABLE\s+AMOUNT\s+EUR\s+([0-9][0-9.,]*)",
         r"TOTAL\s+NET\s+AMOUNT\s+EUR\s+([0-9][0-9.,]*)",
         r"AMOUNT\s+DUE\s+([A-Z]{3})\s+([0-9][0-9.,]*)",

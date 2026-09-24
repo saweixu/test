@@ -321,7 +321,7 @@ def safe_filename_part(value: str) -> str:
     value = normalize_spaces(value).replace(" ", "-")
     value = re.sub(r"[^A-Za-z0-9._+-]+", "-", value)
     value = re.sub(r"-+", "-", value).strip(".-")
-    return value or "Unknown"
+    return (value or "Unknown").upper()
 
 
 def build_proposed_name(containers: list[str], document_type: str, file_name: str) -> str:
@@ -332,7 +332,7 @@ def build_proposed_name(containers: list[str], document_type: str, file_name: st
     else:
         container_part = Path(file_name).stem
 
-    return f"{safe_filename_part(container_part)}-{safe_filename_part(document_type)}.pdf"
+    return f"{safe_filename_part(container_part)}-{safe_filename_part(document_type)}.PDF"
 
 
 def confidence_label(result: dict[str, str]) -> str:
@@ -361,7 +361,7 @@ def parse_invoice(text: str, file_name: str) -> InvoiceResult:
             document_type=VERIFY_TYPE,
             currency="",
             amount="",
-            proposed_name=f"{safe_filename_part(Path(file_name).stem)}-Unreadable.pdf",
+            proposed_name=f"{safe_filename_part(Path(file_name).stem)}-UNREADABLE.PDF",
             confidence="Low",
             notes="Aucun texte extrait; OCR probablement necessaire.",
         )
@@ -397,7 +397,7 @@ def parse_invoice(text: str, file_name: str) -> InvoiceResult:
 
 
 def make_unique_filename(name: str, used: set[str]) -> str:
-    name = safe_filename_part(Path(name).stem) + ".pdf"
+    name = safe_filename_part(Path(name).stem) + ".PDF"
     if name not in used:
         used.add(name)
         return name
@@ -405,7 +405,7 @@ def make_unique_filename(name: str, used: set[str]) -> str:
     stem = Path(name).stem
     suffix = 2
     while True:
-        candidate = f"{stem}-{suffix}.pdf"
+        candidate = f"{stem}-{suffix}.PDF"
         if candidate not in used:
             used.add(candidate)
             return candidate

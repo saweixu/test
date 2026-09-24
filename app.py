@@ -14,6 +14,10 @@ from typing import Iterable
 CONTAINER_RE = re.compile(r"\b([A-Z]{4}\s?\d{7})\b")
 BL_TOKEN_RE = re.compile(r"\b(?:[A-Z]{2,5}\d{5,12}|\d{8,12})\b")
 VERIFY_TYPE = "A verifier"
+APP_TITLE = "Factures shipping"
+APP_BRAND = "Athina Logistics"
+APP_TAGLINE = "Global Access"
+LOGO_FILE_NAMES = ("logo.png", "logo.jpg", "logo.jpeg")
 
 
 @dataclass
@@ -33,6 +37,24 @@ class InvoiceResult:
 
 def normalize_spaces(text: str) -> str:
     return re.sub(r"\s+", " ", text or "").strip()
+
+
+def find_logo_path() -> Path | None:
+    app_dir = Path(__file__).resolve().parent
+    candidates: list[Path] = []
+    for name in LOGO_FILE_NAMES:
+        candidates.extend(
+            [
+                app_dir / name,
+                Path.cwd() / name,
+                Path.cwd() / "outputs" / name,
+            ]
+        )
+
+    for path in candidates:
+        if path.exists():
+            return path
+    return None
 
 
 def extract_pdf_text_from_bytes(data: bytes) -> str:
@@ -414,8 +436,19 @@ def run_streamlit() -> None:
     import pandas as pd
     import streamlit as st
 
-    st.set_page_config(page_title="Factures shipping", layout="wide")
-    st.title("Factures shipping")
+    logo_path = find_logo_path()
+    st.set_page_config(
+        page_title=APP_TITLE,
+        page_icon=str(logo_path) if logo_path else None,
+        layout="wide",
+    )
+
+    if logo_path:
+        st.sidebar.image(str(logo_path), width=200)
+    st.sidebar.markdown(f"### {APP_BRAND}")
+    st.sidebar.caption(APP_TAGLINE)
+
+    st.title(APP_TITLE)
 
     uploads = st.file_uploader("PDF factures", type=["pdf"], accept_multiple_files=True)
     if not uploads:

@@ -155,6 +155,8 @@ def extract_shipping_line(text: str) -> str:
         return "CMA CGM"
     if "EVERGREEN SHIPPING" in upper or "EVERGREEN LINE" in upper:
         return "Evergreen"
+    if "MAERSK" in upper:
+        return "Maersk"
     if "ORIENT OVERSEAS" in upper or "OOCL" in upper:
         return "OOCL"
     if "COSCO SHIPPING" in upper:
@@ -190,6 +192,10 @@ def extract_bl_number(text: str) -> str:
     evergreen_match = re.search(r"\bB/L\s*(?:(?:NR|NO)\.?\s*:|:)\s*([A-Z0-9-]+)", text, re.IGNORECASE)
     if evergreen_match:
         return evergreen_match.group(1).strip()
+
+    maersk_match = re.search(r"\bBill\s+of\s+Lading\s+(\d{8,12})\b", text, re.IGNORECASE)
+    if maersk_match:
+        return maersk_match.group(1).strip()
 
     cma_match = re.search(r"\bBill\s+of\s+Lading\s*:\s*([A-Z0-9-]+)", text, re.IGNORECASE)
     if cma_match:
@@ -258,8 +264,23 @@ def classify_document_type(text: str) -> str:
 
     if not types and "SECURE RELEASE FEE" in upper:
         types.append("Release")
+    if not types and "DESTINATION COORDINATION SERVICES" in upper:
+        types.append("Destination-Coord-Service")
+    if not types and ("CUSTMS INSP FEE" in upper or "CUSTOMS INSP" in upper):
+        types.append("Customs-Insp")
+    if not types and "YARD OCCUPANCY CHARGE" in upper:
+        types.append("YOC")
 
-    preferred_order = ["Storage", "Demurrage", "Detention", "THC", "Release"]
+    preferred_order = [
+        "Storage",
+        "Demurrage",
+        "Detention",
+        "THC",
+        "Release",
+        "Destination-Coord-Service",
+        "Customs-Insp",
+        "YOC",
+    ]
     ordered = [item for item in preferred_order if item in set(types)]
     return "-".join(ordered) if ordered else VERIFY_TYPE
 
@@ -288,6 +309,8 @@ def extract_amount(text: str) -> tuple[str, str]:
             return "EUR", parse_amount(match.group(2) or match.group(1))
 
     patterns = [
+        r"TOTAL\s+PAYABLE\s+AMOUNT\s+EUR\s+([0-9][0-9.,]*)",
+        r"TOTAL\s+NET\s+AMOUNT\s+EUR\s+([0-9][0-9.,]*)",
         r"AMOUNT\s+DUE\s+([A-Z]{3})\s+([0-9][0-9.,]*)",
         r"AMOUNT\s+DUE\s*:?\s*([0-9][0-9.,]*)\s+([A-Z]{3})",
         r"TOTAL\s+AMOUNT\s+TO\s+BE\s+PAID\s+AMOUNT\s+([A-Z]{3})\s+([0-9][0-9.,]*)",
@@ -324,6 +347,11 @@ def safe_filename_part(value: str) -> str:
     return (value or "Unknown").upper()
 
 
+def ensure_invoice_suffix(stem: str) -> str:
+    stem = safe_filename_part(stem)
+    return stem if stem.endswith("-INV") else f"{stem}-INV"
+
+
 def build_proposed_name(containers: list[str], document_type: str, file_name: str) -> str:
     if containers:
         container_part = "_".join(containers[:3])
@@ -332,7 +360,8 @@ def build_proposed_name(containers: list[str], document_type: str, file_name: st
     else:
         container_part = Path(file_name).stem
 
-    return f"{safe_filename_part(container_part)}-{safe_filename_part(document_type)}.PDF"
+    stem = f"{safe_filename_part(container_part)}-{safe_filename_part(document_type)}"
+    return f"{ensure_invoice_suffix(stem)}.PDF"
 
 
 def confidence_label(result: dict[str, str]) -> str:
@@ -361,7 +390,7 @@ def parse_invoice(text: str, file_name: str) -> InvoiceResult:
             document_type=VERIFY_TYPE,
             currency="",
             amount="",
-            proposed_name=f"{safe_filename_part(Path(file_name).stem)}-UNREADABLE.PDF",
+            proposed_name=f"{ensure_invoice_suffix(f'{safe_filename_part(Path(file_name).stem)}-UNREADABLE')}.PDF",
             confidence="Low",
             notes="Aucun texte extrait; OCR probablement necessaire.",
         )
@@ -397,15 +426,16 @@ def parse_invoice(text: str, file_name: str) -> InvoiceResult:
 
 
 def make_unique_filename(name: str, used: set[str]) -> str:
-    name = safe_filename_part(Path(name).stem) + ".PDF"
+    stem = ensure_invoice_suffix(Path(name).stem)
+    name = f"{stem}.PDF"
     if name not in used:
         used.add(name)
         return name
 
-    stem = Path(name).stem
+    base_stem = stem.removesuffix("-INV")
     suffix = 2
     while True:
-        candidate = f"{stem}-{suffix}.PDF"
+        candidate = f"{base_stem}-{suffix}-INV.PDF"
         if candidate not in used:
             used.add(candidate)
             return candidate

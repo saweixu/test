@@ -131,6 +131,8 @@ def extract_shipping_line(text: str) -> str:
         return "Sharer"
     if "CMA - CGM" in upper or "CMA CGM" in upper:
         return "CMA CGM"
+    if "EVERGREEN SHIPPING" in upper or "EVERGREEN LINE" in upper:
+        return "Evergreen"
     if "ORIENT OVERSEAS" in upper or "OOCL" in upper:
         return "OOCL"
     if "COSCO SHIPPING" in upper:
@@ -163,6 +165,10 @@ def extract_invoice_number(text: str, file_name: str) -> str:
 
 
 def extract_bl_number(text: str) -> str:
+    evergreen_match = re.search(r"\bB/L\s*(?:(?:NR|NO)\.?\s*:|:)\s*([A-Z0-9-]+)", text, re.IGNORECASE)
+    if evergreen_match:
+        return evergreen_match.group(1).strip()
+
     cma_match = re.search(r"\bBill\s+of\s+Lading\s*:\s*([A-Z0-9-]+)", text, re.IGNORECASE)
     if cma_match:
         return cma_match.group(1).strip()
@@ -225,6 +231,8 @@ def classify_document_type(text: str) -> str:
 
     if any(term in upper for term in ["DEST TRML HANDLG", "TERMINAL HANDLING", "DTHC", "TRML HANDLG"]):
         types.append("THC")
+    elif re.search(r"\bTHC/[A-Z]\b", upper):
+        types.append("THC")
 
     if not types and "SECURE RELEASE FEE" in upper:
         types.append("Release")
@@ -251,6 +259,12 @@ def parse_amount(value: str) -> str:
 
 
 def extract_amount(text: str) -> tuple[str, str]:
+    upper = text.upper()
+    if "EVERGREEN SHIPPING" in upper or "EVERGREEN LINE" in upper:
+        match = re.search(r"GRAND\s+TOTAL\s+([0-9][0-9.,]*)(?:\s+([0-9][0-9.,]*))?", text, re.IGNORECASE)
+        if match:
+            return "EUR", parse_amount(match.group(2) or match.group(1))
+
     patterns = [
         r"AMOUNT\s+DUE\s+([A-Z]{3})\s+([0-9][0-9.,]*)",
         r"AMOUNT\s+DUE\s*:?\s*([0-9][0-9.,]*)\s+([A-Z]{3})",

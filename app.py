@@ -519,7 +519,7 @@ def run_streamlit() -> None:
 
     st.title(APP_TITLE)
 
-    st.subheader("Preuves de paiement")
+    st.subheader("POP")
     pop_uploads = st.file_uploader(
         "PDF preuves de paiement (POP)",
         type=["pdf"],

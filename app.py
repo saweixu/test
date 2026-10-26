@@ -374,6 +374,35 @@ def build_proposed_name(containers: list[str], document_type: str, file_name: st
     return f"{ensure_invoice_suffix(stem)}.PDF"
 
 
+def build_pop_filename(text: str) -> str:
+    match = re.search(
+        r"\bCOMMUNICATION\s*:\s*(.*?)(?=\bREFERENCE\s+BANQUE\s*:|\bDATE\s+VALEUR\s*:|$)",
+        text,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    if not match:
+        raise ValueError("Communication bancaire introuvable dans le PDF.")
+
+    # Le relevé peut couper un mot entre deux lignes, par exemple ST / ORAGE.
+    communication = re.sub(r"\s+", "", match.group(1)).upper()
+    containers = extract_containers(communication)
+    if len(containers) != 1:
+        raise ValueError("Il faut exactement un numéro de conteneur dans la communication.")
+
+    container = containers[0]
+    if not is_valid_container(container):
+        raise ValueError(f"Numéro de conteneur invalide : {container}.")
+
+    type_match = re.search(rf"(?<![A-Z0-9]){re.escape(container)}/([^/]+)", communication)
+    if not type_match:
+        raise ValueError("Type de facture introuvable après le numéro de conteneur.")
+
+    document_type = safe_filename_part(type_match.group(1))
+    if document_type == "UNKNOWN":
+        raise ValueError("Type de facture illisible dans la communication.")
+    return f"{container}-{document_type} POP.pdf"
+
+
 def confidence_label(result: dict[str, str]) -> str:
     score = 0
     score += 25 if result["container_number"] else 0
@@ -490,6 +519,30 @@ def run_streamlit() -> None:
 
     st.title(APP_TITLE)
 
+    st.subheader("Preuves de paiement")
+    pop_uploads = st.file_uploader(
+        "PDF preuves de paiement (POP)",
+        type=["pdf"],
+        accept_multiple_files=True,
+        key="pop_uploads",
+    )
+    for index, upload in enumerate(pop_uploads or []):
+        data = upload.getvalue()
+        text = extract_pdf_text_from_bytes(data)
+        try:
+            pop_name = build_pop_filename(text)
+        except ValueError as exc:
+            st.error(f"{upload.name} : {exc}")
+            continue
+        st.download_button(
+            f"Télécharger {pop_name}",
+            data=data,
+            file_name=pop_name,
+            mime="application/pdf",
+            key=f"pop_download_{index}",
+        )
+
+    st.subheader("Factures")
     uploads = st.file_uploader("PDF factures", type=["pdf"], accept_multiple_files=True)
     if not uploads:
         st.stop()

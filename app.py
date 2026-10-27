@@ -501,6 +501,22 @@ def build_zip(files: list[tuple[str, bytes]], rows: list[dict[str, str]]) -> byt
     return buffer.getvalue()
 
 
+def build_pop_zip(files: list[tuple[str, bytes]]) -> bytes:
+    buffer = io.BytesIO()
+    used: set[str] = set()
+    with zipfile.ZipFile(buffer, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        for filename, data in files:
+            stem = Path(filename).stem
+            final_name = filename
+            number = 2
+            while final_name.casefold() in used:
+                final_name = f"{stem} ({number}).pdf"
+                number += 1
+            used.add(final_name.casefold())
+            archive.writestr(final_name, data)
+    return buffer.getvalue()
+
+
 def run_streamlit() -> None:
     import pandas as pd
     import streamlit as st
@@ -526,7 +542,8 @@ def run_streamlit() -> None:
         accept_multiple_files=True,
         key="pop_uploads",
     )
-    for index, upload in enumerate(pop_uploads or []):
+    pop_files: list[tuple[str, bytes]] = []
+    for upload in pop_uploads or []:
         data = upload.getvalue()
         text = extract_pdf_text_from_bytes(data)
         try:
@@ -534,12 +551,24 @@ def run_streamlit() -> None:
         except ValueError as exc:
             st.error(f"{upload.name} : {exc}")
             continue
+        pop_files.append((pop_name, data))
+
+    if len(pop_uploads or []) > 1 and pop_files:
+        st.download_button(
+            "Télécharger les POP en ZIP",
+            data=build_pop_zip(pop_files),
+            file_name="POP_renommes.zip",
+            mime="application/zip",
+            key="pop_download_zip",
+        )
+    elif pop_files:
+        pop_name, data = pop_files[0]
         st.download_button(
             f"Télécharger {pop_name}",
             data=data,
             file_name=pop_name,
             mime="application/pdf",
-            key=f"pop_download_{index}",
+            key="pop_download_pdf",
         )
 
     st.subheader("Factures")

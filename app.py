@@ -491,7 +491,7 @@ def parse_arrival_release(text: str, file_name: str) -> dict[str, str]:
         "shipping_line": extract_shipping_line(text),
         "container_number": container_value,
         "bl_number": extract_bl_number(text),
-        "eta": extract_eta(text),
+        "eta": extract_eta(text) if document_type == "AN" else "",
         "document_type": document_type or VERIFY_TYPE.upper(),
         "proposed_name": proposed_name,
         "confidence": confidence,

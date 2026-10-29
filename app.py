@@ -238,6 +238,7 @@ def extract_bl_number(text: str) -> str:
 def classify_document_type(text: str) -> str:
     upper = text.upper()
     types: list[str] = []
+    is_credit_note = bool(re.search(r"\bCREDIT\s+NOTE\b", upper))
 
     if any(
         term in upper
@@ -272,7 +273,11 @@ def classify_document_type(text: str) -> str:
         types.append("Release")
     if not types and "DESTINATION COORDINATION SERVICES" in upper:
         types.append("Destination-Coord-Service")
-    if not types and ("CUSTMS INSP FEE" in upper or "CUSTOMS INSP" in upper):
+    if not types and (
+        "CUSTMS INSP FEE" in upper
+        or "CUSTOMS INSP" in upper
+        or "CUSTOMS INSPECTION" in upper
+    ):
         types.append("Customs-Insp")
     if not types and "YARD OCCUPANCY CHARGE" in upper:
         types.append("YOC")
@@ -291,7 +296,10 @@ def classify_document_type(text: str) -> str:
         "Misc-Charges",
     ]
     ordered = [item for item in preferred_order if item in set(types)]
-    return "-".join(ordered) if ordered else VERIFY_TYPE
+    if not ordered:
+        return VERIFY_TYPE
+    result = "-".join(ordered)
+    return f"Credit-Note-{result}" if is_credit_note else result
 
 
 def parse_amount(value: str) -> str:
@@ -313,22 +321,27 @@ def parse_amount(value: str) -> str:
 def extract_amount(text: str) -> tuple[str, str]:
     upper = text.upper()
     if "EVERGREEN SHIPPING" in upper or "EVERGREEN LINE" in upper:
-        match = re.search(r"GRAND\s+TOTAL\s+([0-9][0-9.,]*)(?:\s+([0-9][0-9.,]*))?", text, re.IGNORECASE)
+        match = re.search(
+            r"GRAND\s+TOTAL\s+([+-]?[0-9][0-9.,]*)(?:\s+([+-]?[0-9][0-9.,]*))?",
+            text,
+            re.IGNORECASE,
+        )
         if match:
             return "EUR", parse_amount(match.group(2) or match.group(1))
 
+    signed_number = r"[+-]?[0-9][0-9.,]*"
     patterns = [
-        r"TOTAL\s*[:：]\s*([A-Z]{3})\s+([0-9][0-9.,]*)",
-        r"TOTAL\s+PAYABLE\s+AMOUNT\s+EUR\s+([0-9][0-9.,]*)",
-        r"TOTAL\s+NET\s+AMOUNT\s+EUR\s+([0-9][0-9.,]*)",
-        r"AMOUNT\s+DUE\s+([A-Z]{3})\s+([0-9][0-9.,]*)",
-        r"AMOUNT\s+DUE\s*:?\s*([0-9][0-9.,]*)\s+([A-Z]{3})",
-        r"TOTAL\s+AMOUNT\s+TO\s+BE\s+PAID\s+AMOUNT\s+([A-Z]{3})\s+([0-9][0-9.,]*)",
-        r"TOTAL\s+AMOUNT\s+DUE\s*:?\s*([0-9][0-9.,]*)\s+([A-Z]{3})",
-        r"TOTAL\s+AMOUNT\s*:?\s*([0-9][0-9.,]*)\s+([A-Z]{3})",
-        r"TOTAL\s+([A-Z]{3})\s+([0-9][0-9.,]*)",
-        r"TOTAL\s+INCLUDING\s+TAX\s+([0-9][0-9.,]*)",
-        r"TOTAL\s+EXCLUDING\s+TAX\s+([0-9][0-9.,]*)",
+        rf"TOTAL\s*[:：]\s*([A-Z]{{3}})\s+({signed_number})",
+        rf"TOTAL\s+PAYABLE\s+AMOUNT\s+EUR\s+({signed_number})",
+        rf"TOTAL\s+NET\s+AMOUNT\s+EUR\s+({signed_number})",
+        rf"AMOUNT\s+DUE\s+([A-Z]{{3}})\s+({signed_number})",
+        rf"AMOUNT\s+DUE\s*:?\s*({signed_number})\s+([A-Z]{{3}})",
+        rf"TOTAL\s+AMOUNT\s+TO\s+BE\s+PAID\s+AMOUNT\s+([A-Z]{{3}})\s+({signed_number})",
+        rf"TOTAL\s+AMOUNT\s+DUE\s*:?\s*({signed_number})\s+([A-Z]{{3}})",
+        rf"TOTAL\s+AMOUNT\s*:?\s*({signed_number})\s+([A-Z]{{3}})",
+        rf"TOTAL\s+([A-Z]{{3}})\s+({signed_number})",
+        rf"TOTAL\s+INCLUDING\s+TAX\s+({signed_number})",
+        rf"TOTAL\s+EXCLUDING\s+TAX\s+({signed_number})",
     ]
     for pattern in patterns:
         match = re.search(pattern, text, flags=re.IGNORECASE)
@@ -401,6 +414,72 @@ def build_pop_filename(text: str) -> str:
     if document_type == "UNKNOWN":
         raise ValueError("Type de facture illisible dans la communication.")
     return f"{container}-{document_type} POP.pdf"
+
+
+def classify_arrival_release(text: str) -> str:
+    upper = text.upper()
+    if re.search(r"\bARRIVAL\s+NOTICE\b|\bNOTICE\s+OF\s+ARRIVAL\b", upper):
+        return "AN"
+    if re.search(
+        r"\bDELIVERY\s+ORDER\b|\bDO\s+ISSUE\s+DATE\b|\bRELEASE\s+ORDER\b",
+        upper,
+    ):
+        return "RLS"
+    return ""
+
+
+def parse_arrival_release(text: str, file_name: str) -> dict[str, str]:
+    document_type = classify_arrival_release(text)
+    containers = [number for number in extract_containers(text) if is_valid_container(number)]
+    containers = dedupe_keep_order(containers)
+    container_value = "; ".join(containers)
+
+    if document_type and len(containers) == 1:
+        proposed_name = f"{containers[0]}-{document_type}.PDF"
+        confidence = "High"
+        notes = ""
+    else:
+        stem = safe_filename_part(Path(file_name).stem)
+        suffix = document_type or VERIFY_TYPE.upper().replace(" ", "-")
+        proposed_name = f"{stem}-{suffix}.PDF"
+        confidence = "Medium" if document_type else "Low"
+        notes_parts = []
+        if not document_type:
+            notes_parts.append("Document type a verifier")
+        if not containers:
+            notes_parts.append("Conteneur non trouve ou invalide")
+        elif len(containers) > 1:
+            notes_parts.append("Plusieurs conteneurs trouves")
+        notes = "; ".join(notes_parts)
+
+    return {
+        "source_file": file_name,
+        "container_number": container_value,
+        "document_type": document_type or VERIFY_TYPE.upper(),
+        "proposed_name": proposed_name,
+        "confidence": confidence,
+        "notes": notes,
+    }
+
+
+def build_arrival_release_zip(
+    files: list[tuple[str, bytes]], rows: list[dict[str, str]]
+) -> bytes:
+    buffer = io.BytesIO()
+    used: set[str] = set()
+    with zipfile.ZipFile(buffer, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        for index, row in enumerate(rows):
+            proposed = row.get("proposed_name") or files[index][0]
+            stem = safe_filename_part(Path(str(proposed)).stem)
+            final_name = f"{stem}.PDF"
+            duplicate = 2
+            while final_name.casefold() in used:
+                final_name = f"{stem}-{duplicate}.PDF"
+                duplicate += 1
+            used.add(final_name.casefold())
+            archive.writestr(final_name, files[index][1])
+    buffer.seek(0)
+    return buffer.getvalue()
 
 
 def confidence_label(result: dict[str, str]) -> str:
@@ -572,72 +651,123 @@ def run_streamlit() -> None:
         )
 
     st.subheader("Factures")
-    uploads = st.file_uploader("PDF factures", type=["pdf"], accept_multiple_files=True)
-    if not uploads:
-        st.stop()
-
-    files: list[tuple[str, bytes]] = []
-    rows: list[dict[str, str]] = []
-
-    for upload in uploads:
-        data = upload.getvalue()
-        files.append((upload.name, data))
-        text = extract_pdf_text_from_bytes(data)
-        rows.append(asdict(parse_invoice(text, upload.name)))
-
-    df = pd.DataFrame(rows)
-    column_order = [
-        "source_file",
-        "shipping_line",
-        "container_number",
-        "bl_number",
-        "invoice_number",
-        "document_type",
-        "currency",
-        "amount",
-        "proposed_name",
-        "confidence",
-        "notes",
-    ]
-    df = df[column_order]
-
-    edited_df = st.data_editor(
-        df,
-        use_container_width=True,
-        hide_index=True,
-        num_rows="fixed",
-        column_config={
-            "source_file": "Fichier original",
-            "shipping_line": "Emetteur facture",
-            "container_number": "Numero conteneur",
-            "bl_number": "Numero BL",
-            "invoice_number": "Numero facture",
-            "document_type": "Type",
-            "currency": "Devise",
-            "amount": "Montant",
-            "proposed_name": "Nom propose",
-            "confidence": "Confiance",
-            "notes": "Notes",
-        },
+    uploads = st.file_uploader(
+        "PDF factures",
+        type=["pdf"],
+        accept_multiple_files=True,
+        key="invoice_uploads",
     )
+    if uploads:
+        files: list[tuple[str, bytes]] = []
+        rows: list[dict[str, str]] = []
 
-    export_df = edited_df.copy()
-    csv_bytes = export_df.to_csv(index=False).encode("utf-8-sig")
+        for upload in uploads:
+            data = upload.getvalue()
+            files.append((upload.name, data))
+            text = extract_pdf_text_from_bytes(data)
+            rows.append(asdict(parse_invoice(text, upload.name)))
 
-    excel_buffer = io.BytesIO()
-    with pd.ExcelWriter(excel_buffer, engine="openpyxl") as writer:
-        export_df.to_excel(writer, index=False, sheet_name="Factures")
-    excel_bytes = excel_buffer.getvalue()
+        df = pd.DataFrame(rows)
+        column_order = [
+            "source_file",
+            "shipping_line",
+            "container_number",
+            "bl_number",
+            "invoice_number",
+            "document_type",
+            "currency",
+            "amount",
+            "proposed_name",
+            "confidence",
+            "notes",
+        ]
+        df = df[column_order]
 
-    zip_bytes = build_zip(files, export_df.to_dict(orient="records"))
+        edited_df = st.data_editor(
+            df,
+            use_container_width=True,
+            hide_index=True,
+            num_rows="fixed",
+            column_config={
+                "source_file": "Fichier original",
+                "shipping_line": "Emetteur facture",
+                "container_number": "Numero conteneur",
+                "bl_number": "Numero BL",
+                "invoice_number": "Numero facture",
+                "document_type": "Type",
+                "currency": "Devise",
+                "amount": "Montant",
+                "proposed_name": "Nom propose",
+                "confidence": "Confiance",
+                "notes": "Notes",
+            },
+        )
 
-    col1, col2, col3 = st.columns(3)
-    with col1:
-        st.download_button("Telecharger Excel", excel_bytes, "factures_shipping.xlsx")
-    with col2:
-        st.download_button("Telecharger CSV", csv_bytes, "factures_shipping.csv")
-    with col3:
-        st.download_button("Telecharger PDF renommes", zip_bytes, "factures_renommees.zip")
+        export_df = edited_df.copy()
+        csv_bytes = export_df.to_csv(index=False).encode("utf-8-sig")
+
+        excel_buffer = io.BytesIO()
+        with pd.ExcelWriter(excel_buffer, engine="openpyxl") as writer:
+            export_df.to_excel(writer, index=False, sheet_name="Factures")
+        excel_bytes = excel_buffer.getvalue()
+
+        zip_bytes = build_zip(files, export_df.to_dict(orient="records"))
+
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            st.download_button("Telecharger Excel", excel_bytes, "factures_shipping.xlsx")
+        with col2:
+            st.download_button("Telecharger CSV", csv_bytes, "factures_shipping.csv")
+        with col3:
+            st.download_button("Telecharger PDF renommes", zip_bytes, "factures_renommees.zip")
+
+    st.subheader("AN + RLS")
+    transport_uploads = st.file_uploader(
+        "PDF Arrival Notice ou Release / Delivery Order",
+        type=["pdf"],
+        accept_multiple_files=True,
+        key="arrival_release_uploads",
+    )
+    if transport_uploads:
+        transport_files: list[tuple[str, bytes]] = []
+        transport_rows: list[dict[str, str]] = []
+
+        for upload in transport_uploads:
+            data = upload.getvalue()
+            transport_files.append((upload.name, data))
+            text = extract_pdf_text_from_bytes(data)
+            transport_rows.append(parse_arrival_release(text, upload.name))
+
+        transport_df = pd.DataFrame(transport_rows)
+        transport_df = transport_df[
+            ["source_file", "container_number", "document_type", "proposed_name", "confidence", "notes"]
+        ]
+        edited_transport_df = st.data_editor(
+            transport_df,
+            use_container_width=True,
+            hide_index=True,
+            num_rows="fixed",
+            column_config={
+                "source_file": "Fichier original",
+                "container_number": "Numero conteneur",
+                "document_type": "Type",
+                "proposed_name": "Nom propose",
+                "confidence": "Confiance",
+                "notes": "Notes",
+            },
+            key="arrival_release_editor",
+        )
+        transport_zip = build_arrival_release_zip(
+            transport_files,
+            edited_transport_df.to_dict(orient="records"),
+        )
+        st.download_button(
+            "Telecharger AN + RLS renommes (ZIP)",
+            data=transport_zip,
+            file_name="AN_RLS_renommes.zip",
+            mime="application/zip",
+            key="arrival_release_download",
+        )
 
 
 def main() -> None:

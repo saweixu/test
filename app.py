@@ -459,7 +459,8 @@ def extract_eta(text: str) -> str:
         nearby_text = text[eta_match.end() : eta_match.end() + 120]
         date_match = DATE_TOKEN_RE.search(nearby_text)
         if date_match:
-            return normalize_spaces(date_match.group(0))
+            eta_date = parse_date_value(date_match.group(0))
+            return eta_date.strftime("%d-%m-%Y") if eta_date else normalize_spaces(date_match.group(0))
     return ""
 
 
@@ -500,7 +501,7 @@ def extract_release_expiry(text: str, document_type: str, shipping_line: str) ->
     availability_date = parse_date_value(date_match.group(0))
     if not availability_date:
         return ""
-    return (availability_date + timedelta(days=5)).strftime("%d %b %Y").upper()
+    return (availability_date + timedelta(days=5)).strftime("%d-%m-%Y")
 
 
 def parse_arrival_release(text: str, file_name: str) -> dict[str, str]:

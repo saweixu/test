@@ -195,6 +195,22 @@ def extract_bl_number(text: str) -> str:
     if master_bl_match:
         return master_bl_match.group(1).strip()
 
+    arrival_notice_match = re.search(
+        r"\bB/L\s*[- ]\s*NO\.?\s*/\s*DEST\s*:\s*([A-Z0-9-]+)",
+        text,
+        re.IGNORECASE,
+    )
+    if arrival_notice_match:
+        return arrival_notice_match.group(1).strip()
+
+    release_order_match = re.search(
+        r"\b(?:ORIGINEEL|ORIGINAL)\s+BILL\s+OF\s+LADING\s+NO\.?\s*[:：]\s*([A-Z0-9-]+)",
+        text,
+        re.IGNORECASE,
+    )
+    if release_order_match:
+        return release_order_match.group(1).strip()
+
     evergreen_match = re.search(r"\bB/L\s*(?:(?:NR|NO)\.?\s*:|:)\s*([A-Z0-9-]+)", text, re.IGNORECASE)
     if evergreen_match:
         return evergreen_match.group(1).strip()
@@ -428,6 +444,24 @@ def classify_arrival_release(text: str) -> str:
     return ""
 
 
+def extract_eta(text: str) -> str:
+    date_pattern = re.compile(
+        r"\b(?:"
+        r"\d{4}[-/]\d{1,2}[-/]\d{1,2}|"
+        r"\d{1,2}[-/. ](?:JAN|FEB|MAR|APR|MAY|JUN|JUL|AUG|SEP|OCT|NOV|DEC)[-/. ]\d{2,4}|"
+        r"(?:JAN|FEB|MAR|APR|MAY|JUN|JUL|AUG|SEP|OCT|NOV|DEC)\s+\d{1,2},?\s+\d{4}|"
+        r"\d{1,2}[/-]\d{1,2}[/-]\d{2,4}"
+        r")\b",
+        re.IGNORECASE,
+    )
+    for eta_match in re.finditer(r"\bETA\b\s*[:：/]?", text, re.IGNORECASE):
+        nearby_text = text[eta_match.end() : eta_match.end() + 120]
+        date_match = date_pattern.search(nearby_text)
+        if date_match:
+            return normalize_spaces(date_match.group(0))
+    return ""
+
+
 def parse_arrival_release(text: str, file_name: str) -> dict[str, str]:
     document_type = classify_arrival_release(text)
     containers = [number for number in extract_containers(text) if is_valid_container(number)]
@@ -454,7 +488,10 @@ def parse_arrival_release(text: str, file_name: str) -> dict[str, str]:
 
     return {
         "source_file": file_name,
+        "shipping_line": extract_shipping_line(text),
         "container_number": container_value,
+        "bl_number": extract_bl_number(text),
+        "eta": extract_eta(text),
         "document_type": document_type or VERIFY_TYPE.upper(),
         "proposed_name": proposed_name,
         "confidence": confidence,
@@ -740,7 +777,17 @@ def run_streamlit() -> None:
 
         transport_df = pd.DataFrame(transport_rows)
         transport_df = transport_df[
-            ["source_file", "container_number", "document_type", "proposed_name", "confidence", "notes"]
+            [
+                "source_file",
+                "shipping_line",
+                "container_number",
+                "bl_number",
+                "eta",
+                "document_type",
+                "proposed_name",
+                "confidence",
+                "notes",
+            ]
         ]
         edited_transport_df = st.data_editor(
             transport_df,
@@ -749,7 +796,10 @@ def run_streamlit() -> None:
             num_rows="fixed",
             column_config={
                 "source_file": "Fichier original",
+                "shipping_line": "Shipping line",
                 "container_number": "Numero conteneur",
+                "bl_number": "Numero BL",
+                "eta": "ETA (date d'arrivee)",
                 "document_type": "Type",
                 "proposed_name": "Nom propose",
                 "confidence": "Confiance",

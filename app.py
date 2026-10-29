@@ -6,6 +6,7 @@ import json
 import re
 import zipfile
 from dataclasses import asdict, dataclass
+from datetime import datetime, timedelta
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Iterable
@@ -18,6 +19,15 @@ APP_TITLE = "Factures shipping"
 APP_BRAND = "Athina Logistics"
 APP_TAGLINE = "Global Access"
 LOGO_FILE_NAMES = ("logo.png", "logo.jpg", "logo.jpeg")
+DATE_TOKEN_RE = re.compile(
+    r"\b(?:"
+    r"\d{4}[-/]\d{1,2}[-/]\d{1,2}|"
+    r"\d{1,2}[-/. ](?:JAN|FEB|MAR|APR|MAY|JUN|JUL|AUG|SEP|OCT|NOV|DEC)[-/. ]\d{2,4}|"
+    r"(?:JAN|FEB|MAR|APR|MAY|JUN|JUL|AUG|SEP|OCT|NOV|DEC)\s+\d{1,2},?\s+\d{4}|"
+    r"\d{1,2}[/-]\d{1,2}[/-]\d{2,4}"
+    r")\b",
+    re.IGNORECASE,
+)
 
 
 @dataclass
@@ -445,25 +455,57 @@ def classify_arrival_release(text: str) -> str:
 
 
 def extract_eta(text: str) -> str:
-    date_pattern = re.compile(
-        r"\b(?:"
-        r"\d{4}[-/]\d{1,2}[-/]\d{1,2}|"
-        r"\d{1,2}[-/. ](?:JAN|FEB|MAR|APR|MAY|JUN|JUL|AUG|SEP|OCT|NOV|DEC)[-/. ]\d{2,4}|"
-        r"(?:JAN|FEB|MAR|APR|MAY|JUN|JUL|AUG|SEP|OCT|NOV|DEC)\s+\d{1,2},?\s+\d{4}|"
-        r"\d{1,2}[/-]\d{1,2}[/-]\d{2,4}"
-        r")\b",
-        re.IGNORECASE,
-    )
     for eta_match in re.finditer(r"\bETA\b\s*[:：/]?", text, re.IGNORECASE):
         nearby_text = text[eta_match.end() : eta_match.end() + 120]
-        date_match = date_pattern.search(nearby_text)
+        date_match = DATE_TOKEN_RE.search(nearby_text)
         if date_match:
             return normalize_spaces(date_match.group(0))
     return ""
 
 
+def parse_date_value(value: str) -> datetime | None:
+    normalized = normalize_spaces(value).upper().replace(",", "")
+    months = {
+        "JAN": "01", "FEB": "02", "MAR": "03", "APR": "04",
+        "MAY": "05", "JUN": "06", "JUL": "07", "AUG": "08",
+        "SEP": "09", "OCT": "10", "NOV": "11", "DEC": "12",
+    }
+    for month, number in months.items():
+        normalized = re.sub(rf"\b{month}\b", number, normalized)
+
+    for date_format in (
+        "%m %d %Y", "%m-%d-%Y", "%m-%d-%y", "%d-%m-%Y", "%d-%m-%y",
+        "%Y-%m-%d", "%Y/%m/%d", "%d/%m/%Y", "%m/%d/%Y", "%d.%m.%Y",
+    ):
+        try:
+            return datetime.strptime(normalized, date_format)
+        except ValueError:
+            continue
+    return None
+
+
+def extract_release_expiry(text: str, document_type: str, shipping_line: str) -> str:
+    if document_type != "RLS" or shipping_line.upper() != "COSCO":
+        return ""
+
+    label_match = re.search(r"ESTIMATED\s+CARGO\s+AVAILABILITY\s+DATE", text, re.IGNORECASE)
+    if not label_match:
+        return ""
+
+    nearby_text = text[label_match.end() : label_match.end() + 120]
+    date_match = DATE_TOKEN_RE.search(nearby_text)
+    if not date_match:
+        return ""
+
+    availability_date = parse_date_value(date_match.group(0))
+    if not availability_date:
+        return ""
+    return (availability_date + timedelta(days=5)).strftime("%d %b %Y").upper()
+
+
 def parse_arrival_release(text: str, file_name: str) -> dict[str, str]:
     document_type = classify_arrival_release(text)
+    shipping_line = extract_shipping_line(text)
     containers = [number for number in extract_containers(text) if is_valid_container(number)]
     containers = dedupe_keep_order(containers)
     container_value = "; ".join(containers)
@@ -488,10 +530,11 @@ def parse_arrival_release(text: str, file_name: str) -> dict[str, str]:
 
     return {
         "source_file": file_name,
-        "shipping_line": extract_shipping_line(text),
+        "shipping_line": shipping_line,
         "container_number": container_value,
         "bl_number": extract_bl_number(text),
         "eta": extract_eta(text) if document_type == "AN" else "",
+        "expiry_date": extract_release_expiry(text, document_type, shipping_line),
         "document_type": document_type or VERIFY_TYPE.upper(),
         "proposed_name": proposed_name,
         "confidence": confidence,
@@ -783,6 +826,7 @@ def run_streamlit() -> None:
                 "container_number",
                 "bl_number",
                 "eta",
+                "expiry_date",
                 "document_type",
                 "proposed_name",
                 "confidence",
@@ -800,6 +844,7 @@ def run_streamlit() -> None:
                 "container_number": "Numero conteneur",
                 "bl_number": "Numero BL",
                 "eta": "ETA (date d'arrivee)",
+                "expiry_date": "Date d'expiration",
                 "document_type": "Type",
                 "proposed_name": "Nom propose",
                 "confidence": "Confiance",

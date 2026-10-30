@@ -321,6 +321,8 @@ def classify_document_type(text: str) -> str:
         types.append("THC")
     elif re.search(r"\bTHC/[A-Z]\b", upper):
         types.append("THC")
+    elif re.search(r"(?m)^\s*THC(?:\s|$)", upper):
+        types.append("THC")
 
     if not types and "SECURE RELEASE FEE" in upper:
         types.append("Release")
@@ -384,6 +386,7 @@ def extract_amount(text: str) -> tuple[str, str]:
 
     signed_number = r"[+-]?[0-9][0-9.,]*"
     patterns = [
+        rf"TOTAL\s+INVOICE\s+AMOUNT\s*[:：]?\s*([A-Z]{{3}})\s+({signed_number})",
         rf"TOTAL\s*[:：]\s*([A-Z]{{3}})\s+({signed_number})",
         rf"TOTAL\s+PAYABLE\s+AMOUNT\s+EUR\s+({signed_number})",
         rf"TOTAL\s+NET\s+AMOUNT\s+EUR\s+({signed_number})",

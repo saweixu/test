@@ -334,6 +334,12 @@ def classify_document_type(text: str) -> str:
         or "CUSTOMS INSPECTION" in upper
     ):
         types.append("Customs-Insp")
+    if (
+        not types
+        and re.search(r"\bCMA\s*-?\s*CGM\b", upper)
+        and re.search(r"\bINSPECTION\b", upper)
+    ):
+        types.append("Inspection")
     if not types and "YARD OCCUPANCY CHARGE" in upper:
         types.append("YOC")
     if not types and re.search(r"\bMISC(?:ELLANEOUS)?\s+CHARGES?\b", upper):
@@ -347,6 +353,7 @@ def classify_document_type(text: str) -> str:
         "Release",
         "Destination-Coord-Service",
         "Customs-Insp",
+        "Inspection",
         "YOC",
         "Misc-Charges",
     ]

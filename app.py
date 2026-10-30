@@ -491,6 +491,7 @@ def extract_eta(text: str) -> str:
         r"(?:(?:MONDAY|TUESDAY|WEDNESDAY|THURSDAY|FRIDAY|SATURDAY|SUNDAY)\s*,?\s*)?"
     )
     eta_patterns = [
+        rf"\bPOD\s*/?\s*ETA\s*[:：]\s*[^\r\n]{{0,180}}?({date_pattern})",
         rf"\bETA(?:\s+[A-Z]{{3,8}})?\s*[:：]\s*({date_pattern})",
         rf"\bETA\s+AT\s+POD\b[\s\S]{{0,240}}?\bON\s*[:：]?\s*{weekday_pattern}({date_pattern})",
         rf"\bDUE\s+TO\s+ARRIVE\s+ABOARD\s+SUBJECT\s+({date_pattern})",

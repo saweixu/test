@@ -23,7 +23,7 @@ DATE_TOKEN_RE = re.compile(
     r"\b(?:"
     r"\d{4}[-/]\d{1,2}[-/]\d{1,2}|"
     r"\d{8}|"
-    r"\d{1,2}[-/. ](?:JAN|FEB|MAR|APR|MAY|JUN|JUL|AUG|SEP|OCT|NOV|DEC)[-/. ]\d{2,4}|"
+    r"\d{1,2}[-/. ](?:JAN|FEB|MAR|APR|MAY|JUN|JUL|AUG|SEP|OCT|NOV|DEC),?[-/. ]\d{2,4}|"
     r"(?:JAN|FEB|MAR|APR|MAY|JUN|JUL|AUG|SEP|OCT|NOV|DEC)\s+\d{1,2},?\s+\d{4}|"
     r"\d{1,2}[/-]\d{1,2}[/-]\d{2,4}"
     r")\b",

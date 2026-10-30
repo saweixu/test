@@ -269,7 +269,7 @@ def extract_bl_number(text: str) -> str:
 def extract_bl_numbers(text: str) -> list[str]:
     """Read BL values following common shipping-document labels."""
     label_re = re.compile(
-        r"\b(?:M/?BL|B/?L|BILL\s+OF\s+LADING|TRANSPORT\s+DOCUMENT)"
+        r"\b(?:M/?BL|B/?L|BILL\s+OF\s+LADING|TRANSPORT\s+DOCUMENT|MASTER)"
         r"\s*(?:[- ]\s*)?(?:NO\.?|NUMBER|NR\.?)\s*[:：]?",
         re.IGNORECASE,
     )

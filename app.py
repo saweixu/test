@@ -484,9 +484,12 @@ def classify_arrival_release(text: str) -> str:
 
 def extract_eta(text: str) -> str:
     date_pattern = DATE_TOKEN_RE.pattern
+    weekday_pattern = (
+        r"(?:(?:MONDAY|TUESDAY|WEDNESDAY|THURSDAY|FRIDAY|SATURDAY|SUNDAY)\s*,?\s*)?"
+    )
     eta_patterns = [
         rf"\bETA(?:\s+[A-Z]{{3,8}})?\s*[:：]\s*({date_pattern})",
-        rf"\bETA\s+AT\s+POD\b[\s\S]{{0,240}}?\bON\s*[:：]?\s*({date_pattern})",
+        rf"\bETA\s+AT\s+POD\b[\s\S]{{0,240}}?\bON\s*[:：]?\s*{weekday_pattern}({date_pattern})",
         rf"\bDUE\s+TO\s+ARRIVE\s+ABOARD\s+SUBJECT\s+({date_pattern})",
     ]
     for pattern in eta_patterns:
@@ -509,7 +512,7 @@ def parse_date_value(value: str) -> datetime | None:
         normalized = re.sub(rf"\b{month}\b", number, normalized)
 
     for date_format in (
-        "%m %d %Y", "%m-%d-%Y", "%m-%d-%y", "%d-%m-%Y", "%d-%m-%y",
+        "%m %d %Y", "%d %m %Y", "%m-%d-%Y", "%m-%d-%y", "%d-%m-%Y", "%d-%m-%y",
         "%Y-%m-%d", "%Y/%m/%d", "%Y%m%d", "%d/%m/%Y", "%m/%d/%Y", "%d.%m.%Y",
     ):
         try:
@@ -524,9 +527,18 @@ def extract_release_expiry(text: str, document_type: str, shipping_line: str) ->
         return ""
 
     date_pattern = DATE_TOKEN_RE.pattern
+    pin_validity_match = re.search(r"\bPIN\s+VALID\s+UNTIL\b", text, re.IGNORECASE)
+    if pin_validity_match:
+        # CMA CGM prints this as a table heading; its date appears on the next row.
+        nearby_text = text[pin_validity_match.end() : pin_validity_match.end() + 320]
+        pin_date_match = DATE_TOKEN_RE.search(nearby_text)
+        if pin_date_match:
+            pin_expiry = parse_date_value(pin_date_match.group(0))
+            if pin_expiry:
+                return pin_expiry.strftime("%d-%m-%Y")
+
     explicit_patterns = [
         rf"\bRELEASE\s+EXPIRE\b\s*[:：]?\s*({date_pattern})",
-        rf"\bPIN\s+VALID\s+UNTIL\b\s*[:：]?\s*({date_pattern})",
     ]
     for pattern in explicit_patterns:
         date_match = re.search(pattern, text, re.IGNORECASE)
@@ -546,7 +558,11 @@ def extract_release_expiry(text: str, document_type: str, shipping_line: str) ->
             if expiry:
                 return expiry.strftime("%d-%m-%Y")
 
-    label_match = re.search(r"ESTIMATED\s+CARGO\s+AVAILABILITY\s+DATE", text, re.IGNORECASE)
+    label_match = re.search(
+        r"ESTIMATED\s+CARGO\s+(?:AVAILABILITY|ARRIVAL)\s+DATE",
+        text,
+        re.IGNORECASE,
+    )
     if not label_match:
         return ""
 
@@ -572,8 +588,9 @@ def parse_arrival_release(text: str, file_name: str) -> dict[str, str]:
     eta_value = extract_eta(text) if document_type == "AN" else ""
     expiry_value = extract_release_expiry(text, document_type, shipping_line)
 
-    if document_type and len(containers) == 1 and len(bl_numbers) <= 1:
-        proposed_name = f"{containers[0]}-{document_type}.PDF"
+    if document_type and containers and (len(containers) > 1 or len(bl_numbers) <= 1):
+        container_stem = "_".join(containers)
+        proposed_name = f"{container_stem}-{document_type}.PDF"
     else:
         stem = safe_filename_part(Path(file_name).stem)
         suffix = document_type or VERIFY_TYPE.upper().replace(" ", "-")

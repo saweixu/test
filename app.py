@@ -22,6 +22,7 @@ LOGO_FILE_NAMES = ("logo.png", "logo.jpg", "logo.jpeg")
 DATE_TOKEN_RE = re.compile(
     r"\b(?:"
     r"\d{4}[-/]\d{1,2}[-/]\d{1,2}|"
+    r"\d{8}|"
     r"\d{1,2}[-/. ](?:JAN|FEB|MAR|APR|MAY|JUN|JUL|AUG|SEP|OCT|NOV|DEC)[-/. ]\d{2,4}|"
     r"(?:JAN|FEB|MAR|APR|MAY|JUN|JUL|AUG|SEP|OCT|NOV|DEC)\s+\d{1,2},?\s+\d{4}|"
     r"\d{1,2}[/-]\d{1,2}[/-]\d{2,4}"
@@ -201,6 +202,10 @@ def extract_invoice_number(text: str, file_name: str) -> str:
 
 
 def extract_bl_number(text: str) -> str:
+    labelled_numbers = extract_bl_numbers(text)
+    if labelled_numbers:
+        return labelled_numbers[0]
+
     master_bl_match = re.search(r"\bM/?BL\s+NO\.?\s*[:：]\s*([A-Z0-9-]+)", text, re.IGNORECASE)
     if master_bl_match:
         return master_bl_match.group(1).strip()
@@ -259,6 +264,28 @@ def extract_bl_number(text: str) -> str:
     if fallback:
         return fallback.group(1).strip()
     return ""
+
+
+def extract_bl_numbers(text: str) -> list[str]:
+    """Read BL values following common shipping-document labels."""
+    label_re = re.compile(
+        r"\b(?:M/?BL|B/?L|BILL\s+OF\s+LADING|TRANSPORT\s+DOCUMENT)"
+        r"\s*(?:[- ]\s*)?(?:NO\.?|NUMBER|NR\.?)\s*[:：]?",
+        re.IGNORECASE,
+    )
+    candidate_re = re.compile(
+        r"(?<![A-Z0-9])(?:[A-Z]{2,5}\s*\d{5,12}|\d{8,12})(?![A-Z0-9])",
+        re.IGNORECASE,
+    )
+    values: list[str] = []
+    for label_match in label_re.finditer(text):
+        following = text[label_match.end() : label_match.end() + 240]
+        candidate = candidate_re.search(following)
+        if candidate:
+            value = re.sub(r"\s+", "", candidate.group(0)).upper()
+            if value not in values:
+                values.append(value)
+    return values
 
 
 def classify_document_type(text: str) -> str:
@@ -447,7 +474,8 @@ def classify_arrival_release(text: str) -> str:
     if re.search(r"\bARRIVAL\s+NOTICE\b|\bNOTICE\s+OF\s+ARRIVAL\b", upper):
         return "AN"
     if re.search(
-        r"\bDELIVERY\s+ORDER\b|\bDO\s+ISSUE\s+DATE\b|\bRELEASE\s+ORDER\b",
+        r"\bDELIVERY\s+ORDER\b|\bDO\s+ISSUE\s+DATE\b|\bRELEASE\s+ORDER\b|"
+        r"\bRELEASE\s+NOTIFICATION\b|\bCARGO\s+RELEASE\s+NOTICE\b",
         upper,
     ):
         return "RLS"
@@ -455,12 +483,18 @@ def classify_arrival_release(text: str) -> str:
 
 
 def extract_eta(text: str) -> str:
-    for eta_match in re.finditer(r"\bETA\b\s*[:：/]?", text, re.IGNORECASE):
-        nearby_text = text[eta_match.end() : eta_match.end() + 120]
-        date_match = DATE_TOKEN_RE.search(nearby_text)
+    date_pattern = DATE_TOKEN_RE.pattern
+    eta_patterns = [
+        rf"\bETA(?:\s+[A-Z]{{3,8}})?\s*[:：]\s*({date_pattern})",
+        rf"\bETA\s+AT\s+POD\b[\s\S]{{0,240}}?\bON\s*[:：]?\s*({date_pattern})",
+        rf"\bDUE\s+TO\s+ARRIVE\s+ABOARD\s+SUBJECT\s+({date_pattern})",
+    ]
+    for pattern in eta_patterns:
+        date_match = re.search(pattern, text, re.IGNORECASE)
         if date_match:
-            eta_date = parse_date_value(date_match.group(0))
-            return eta_date.strftime("%d-%m-%Y") if eta_date else normalize_spaces(date_match.group(0))
+            eta_date = parse_date_value(date_match.group(1))
+            if eta_date:
+                return eta_date.strftime("%d-%m-%Y")
     return ""
 
 
@@ -476,7 +510,7 @@ def parse_date_value(value: str) -> datetime | None:
 
     for date_format in (
         "%m %d %Y", "%m-%d-%Y", "%m-%d-%y", "%d-%m-%Y", "%d-%m-%y",
-        "%Y-%m-%d", "%Y/%m/%d", "%d/%m/%Y", "%m/%d/%Y", "%d.%m.%Y",
+        "%Y-%m-%d", "%Y/%m/%d", "%Y%m%d", "%d/%m/%Y", "%m/%d/%Y", "%d.%m.%Y",
     ):
         try:
             return datetime.strptime(normalized, date_format)
@@ -486,8 +520,31 @@ def parse_date_value(value: str) -> datetime | None:
 
 
 def extract_release_expiry(text: str, document_type: str, shipping_line: str) -> str:
-    if document_type != "RLS" or shipping_line.upper() != "COSCO":
+    if document_type != "RLS":
         return ""
+
+    date_pattern = DATE_TOKEN_RE.pattern
+    explicit_patterns = [
+        rf"\bRELEASE\s+EXPIRE\b\s*[:：]?\s*({date_pattern})",
+        rf"\bPIN\s+VALID\s+UNTIL\b\s*[:：]?\s*({date_pattern})",
+    ]
+    for pattern in explicit_patterns:
+        date_match = re.search(pattern, text, re.IGNORECASE)
+        if date_match:
+            expiry = parse_date_value(date_match.group(1))
+            if expiry:
+                return expiry.strftime("%d-%m-%Y")
+
+    valid_to_match = re.search(r"\bVALID\s+TO\s+DATE(?:\s+TIME)?\b", text, re.IGNORECASE)
+    if valid_to_match:
+        nearby_text = text[valid_to_match.end() : valid_to_match.end() + 180]
+        dates = list(DATE_TOKEN_RE.finditer(nearby_text))
+        # In Maersk release orders, the row lists Release Date first and Valid to Date second.
+        if dates:
+            selected = dates[1] if len(dates) > 1 else dates[0]
+            expiry = parse_date_value(selected.group(0))
+            if expiry:
+                return expiry.strftime("%d-%m-%Y")
 
     label_match = re.search(r"ESTIMATED\s+CARGO\s+AVAILABILITY\s+DATE", text, re.IGNORECASE)
     if not label_match:
@@ -510,37 +567,112 @@ def parse_arrival_release(text: str, file_name: str) -> dict[str, str]:
     containers = [number for number in extract_containers(text) if is_valid_container(number)]
     containers = dedupe_keep_order(containers)
     container_value = "; ".join(containers)
+    bl_numbers = extract_bl_numbers(text)
+    bl_value = "; ".join(bl_numbers)
+    eta_value = extract_eta(text) if document_type == "AN" else ""
+    expiry_value = extract_release_expiry(text, document_type, shipping_line)
 
-    if document_type and len(containers) == 1:
+    if document_type and len(containers) == 1 and len(bl_numbers) <= 1:
         proposed_name = f"{containers[0]}-{document_type}.PDF"
-        confidence = "High"
-        notes = ""
     else:
         stem = safe_filename_part(Path(file_name).stem)
         suffix = document_type or VERIFY_TYPE.upper().replace(" ", "-")
         proposed_name = f"{stem}-{suffix}.PDF"
-        confidence = "Medium" if document_type else "Low"
-        notes_parts = []
-        if not document_type:
-            notes_parts.append("Document type a verifier")
-        if not containers:
-            notes_parts.append("Conteneur non trouve ou invalide")
-        elif len(containers) > 1:
-            notes_parts.append("Plusieurs conteneurs trouves")
-        notes = "; ".join(notes_parts)
+
+    notes_parts = []
+    if not document_type:
+        notes_parts.append("Document type a verifier")
+    if not containers:
+        notes_parts.append("Conteneur non trouve ou invalide")
+    elif len(containers) > 1:
+        notes_parts.append("Plusieurs conteneurs trouves")
+    if not bl_numbers:
+        notes_parts.append("BL non trouve")
+    elif len(bl_numbers) > 1:
+        notes_parts.append("Plusieurs BL trouves")
+    if not shipping_line:
+        notes_parts.append("Shipping line non identifiee")
+    if document_type == "AN" and not eta_value:
+        notes_parts.append("ETA non trouvee")
+    notes = "; ".join(notes_parts)
+
+    if not document_type or not containers:
+        confidence = "Low"
+    elif len(containers) > 1 or len(bl_numbers) > 1:
+        confidence = "Medium"
+    elif not bl_numbers or not shipping_line or (document_type == "AN" and not eta_value):
+        confidence = "Medium"
+    else:
+        confidence = "High"
 
     return {
         "source_file": file_name,
         "shipping_line": shipping_line,
         "container_number": container_value,
-        "bl_number": extract_bl_number(text),
-        "eta": extract_eta(text) if document_type == "AN" else "",
-        "expiry_date": extract_release_expiry(text, document_type, shipping_line),
+        "bl_number": bl_value,
+        "eta": eta_value,
+        "expiry_date": expiry_value,
         "document_type": document_type or VERIFY_TYPE.upper(),
         "proposed_name": proposed_name,
         "confidence": confidence,
         "notes": notes,
     }
+
+
+def split_evergreen_combined_arrival_pdf(
+    data: bytes, file_name: str
+) -> list[tuple[str, bytes]]:
+    """Split Evergreen bundles whose pages 3 onward are individual arrival notices."""
+    unchanged = [(file_name, data)]
+
+    try:
+        import pdfplumber
+
+        with pdfplumber.open(io.BytesIO(data)) as pdf:
+            page_texts = [page.extract_text() or "" for page in pdf.pages]
+
+        if len(page_texts) <= 3:
+            return unchanged
+
+        full_text = "\n".join(page_texts)
+        if not re.search(r"\bEVERGREEN\s+(?:SHIPPING\s+AGENCY|LINE)\b", full_text, re.IGNORECASE):
+            return unchanged
+
+        notice_pages: list[tuple[int, str, str]] = []
+        for page_index in range(2, len(page_texts)):
+            page_text = page_texts[page_index]
+            containers = dedupe_keep_order(
+                number
+                for number in extract_containers(page_text)
+                if is_valid_container(number)
+            )
+            bl_numbers = extract_bl_numbers(page_text)
+            if classify_arrival_release(page_text) != "AN" or len(containers) != 1:
+                return unchanged
+            if len(bl_numbers) > 1:
+                return unchanged
+            notice_pages.append((page_index, page_text, containers[0]))
+
+        if len(notice_pages) < 2:
+            return unchanged
+        if len({container for _, _, container in notice_pages}) != len(notice_pages):
+            return unchanged
+
+        from pypdf import PdfReader, PdfWriter
+
+        reader = PdfReader(io.BytesIO(data))
+        split_files: list[tuple[str, bytes]] = []
+        for page_index, _, _ in notice_pages:
+            writer = PdfWriter()
+            writer.add_page(reader.pages[page_index])
+            page_buffer = io.BytesIO()
+            writer.write(page_buffer)
+            split_files.append(
+                (f"{file_name} (page {page_index + 1})", page_buffer.getvalue())
+            )
+        return split_files
+    except Exception:
+        return unchanged
 
 
 def build_arrival_release_zip(
@@ -815,9 +947,11 @@ def run_streamlit() -> None:
 
         for upload in transport_uploads:
             data = upload.getvalue()
-            transport_files.append((upload.name, data))
-            text = extract_pdf_text_from_bytes(data)
-            transport_rows.append(parse_arrival_release(text, upload.name))
+            upload_files = split_evergreen_combined_arrival_pdf(data, upload.name)
+            for source_name, pdf_data in upload_files:
+                transport_files.append((source_name, pdf_data))
+                text = extract_pdf_text_from_bytes(pdf_data)
+                transport_rows.append(parse_arrival_release(text, source_name))
 
         transport_df = pd.DataFrame(transport_rows)
         transport_df = transport_df[
